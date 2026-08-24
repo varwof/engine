@@ -101,20 +101,20 @@ go test ./db/ -bench . -benchmem -benchtime=300ms -run '^$'
 go test ./engine/ -bench '^BenchmarkGetCertStatus$' -benchmem -run '^$'
 ```
 
-Key baselines (Raspberry Pi 4B / ARM64):
+Key baselines (Intel Core Ultra 5 125H / x86_64 / Go 1.26.7, `-benchtime=300ms`):
 
 | Benchmark | Metric |
 | --- | --- |
-| `BenchmarkGetCertStatus` | Hit ~303ns / miss ~160ns, zero SQL |
-| `BenchmarkIssueCertMemory` | Memory write ~14µs/op (excludes persistence) |
-| `BenchmarkRevokedSetPutAll` vs `Put` | n=1000: 1.06ms vs 2.20ms (~2.1×, O(n log n) batch path) |
-| `BenchmarkRevokedSetPruneExpired` | n=1000 ~1.3ms / n=10000 ~14.2ms |
-| `BenchmarkGetRevokedCertEntries` | 1K revoked set CRL traversal ~4ms, pure memory |
-| `BenchmarkConsumeNonce` | ~1ms/op, throttled by SQLite single-writer queue |
-| `BenchmarkRecordBufferAdd` | No WAL ~356ns, 0 allocs |
-| `BenchmarkRecordBufferAddWAL` | ~430µs/op (fsync every 100 records) |
-| `BenchmarkCacheGetHit` | Hit ~313ns, read-lock path (parallel hits don't serialize) |
-| `BenchmarkCacheSetAtCapacity` | Capacity-full eviction ~880ns/op |
+| `BenchmarkGetCertStatus` | Hit ~230ns / miss ~45ns, zero SQL |
+| `BenchmarkIssueCertMemory` | Memory write ~7.2µs/op (excludes persistence) |
+| `BenchmarkRevokedSetPutAll` vs `Put` | n=1000: 0.40ms vs 0.63ms (~1.6×, O(n log n) batch path) |
+| `BenchmarkRevokedSetPruneExpired` | n=1000 ~0.50ms / n=10000 ~3.7ms |
+| `BenchmarkGetRevokedCertEntries` | 1K revoked set CRL traversal ~0.86ms, pure memory |
+| `BenchmarkConsumeNonce` | ~0.63µs/op, in-memory consume; DB write enqueued async |
+| `BenchmarkRecordBufferAdd` | No WAL ~410ns, 0 allocs |
+| `BenchmarkRecordBufferAddWAL` | ~18µs/op (fsync every 100 records) |
+| `BenchmarkCacheGetHit` | Hit ~212ns, read-lock path (parallel hits don't serialize) |
+| `BenchmarkCacheSetAtCapacity` | Capacity-full eviction ~336ns/op |
 
 ## License
 

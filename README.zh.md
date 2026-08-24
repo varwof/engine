@@ -101,20 +101,20 @@ go test ./db/ -bench . -benchmem -benchtime=300ms -run '^$'
 go test ./engine/ -bench '^BenchmarkGetCertStatus$' -benchmem -run '^$'
 ```
 
-关键基线（树莓派 4B / ARM64 实测）：
+关键基线（Intel Core Ultra 5 125H / x86_64 / Go 1.26.7，`-benchtime=300ms`）：
 
 | 基准 | 指标 |
 | --- | --- |
-| `BenchmarkGetCertStatus` | 命中 ~303ns / 未命中 ~160ns，零 SQL |
-| `BenchmarkIssueCertMemory` | 内存写 ~14µs/次（不含落库） |
-| `BenchmarkRevokedSetPutAll` vs `Put` | n=1000 时 1.06ms vs 2.20ms（~2.1x，O(n log n) 批量路径） |
-| `BenchmarkRevokedSetPruneExpired` | n=1000 ~1.3ms / n=10000 ~14.2ms |
-| `BenchmarkGetRevokedCertEntries` | 1K 吊销集 CRL 遍历 ~4ms，纯内存 |
-| `BenchmarkConsumeNonce` | ~1ms/次，受 SQLite 单写队列限流 |
-| `BenchmarkRecordBufferAdd` | 无 WAL ~356ns、0 alloc |
-| `BenchmarkRecordBufferAddWAL` | ~430µs/条（每 100 条 fsync 一次） |
-| `BenchmarkCacheGetHit` | 命中 ~313ns，读锁路径（并行命中不串行） |
-| `BenchmarkCacheSetAtCapacity` | 容量满逐出 ~880ns/次 |
+| `BenchmarkGetCertStatus` | 命中 ~230ns / 未命中 ~45ns，零 SQL |
+| `BenchmarkIssueCertMemory` | 内存写 ~7.2µs/次（不含落库） |
+| `BenchmarkRevokedSetPutAll` vs `Put` | n=1000 时 0.40ms vs 0.63ms（~1.6x，O(n log n) 批量路径） |
+| `BenchmarkRevokedSetPruneExpired` | n=1000 ~0.50ms / n=10000 ~3.7ms |
+| `BenchmarkGetRevokedCertEntries` | 1K 吊销集 CRL 遍历 ~0.86ms，纯内存 |
+| `BenchmarkConsumeNonce` | ~0.63µs/次，内存消费；DB 写异步入队 |
+| `BenchmarkRecordBufferAdd` | 无 WAL ~410ns、0 alloc |
+| `BenchmarkRecordBufferAddWAL` | ~18µs/条（每 100 条 fsync 一次） |
+| `BenchmarkCacheGetHit` | 命中 ~212ns，读锁路径（并行命中不串行） |
+| `BenchmarkCacheSetAtCapacity` | 容量满逐出 ~336ns/次 |
 
 ## License
 
