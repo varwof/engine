@@ -13,6 +13,7 @@
 | `(*Engine) FlushAll() error` | engine.go |
 | `(*Engine) Loading() bool` | engine.go |
 | `(*Engine) DB() *db.DB` | engine.go |
+| `(*Engine) SetDB(d *db.DB)` | engine.go |
 
 ## Certificate Reads
 
@@ -32,6 +33,7 @@
 |---|---|
 | `(*Engine) IssueCert(rec *db.CertRecord) error` | writes.go |
 | `(*Engine) RevokeCert(caName, serial string, reason int) error` | writes.go |
+| `(*Engine) RevokeCertsBatch(entries []RevokeBatchEntry) (int, []RevokeBatchEntry, error)` | writes.go |
 | `(*Engine) RevokeCertsByPrincipalUid(uid string, reason int) (int, error)` | writes.go |
 | `(*Engine) RevokeCertsBySubCA(caName string, reason int) (int, error)` | writes.go |
 
@@ -40,6 +42,8 @@
 | Function | File |
 |---|---|
 | `(*Engine) GetRevokedCertEntries(caName string) ([]*db.RevokedCertEntry, error)` | reads.go |
+| `(*Engine) GetRevokedCertEntriesSince(caName string, since time.Time) ([]*db.RevokedCertEntry, error)` | reads.go |
+| `(*Engine) GetRevokedCerts(caName string) ([]*db.CertRecord, error)` | reads.go |
 | `(*Engine) GetRevokedCerts(caName string) ([]*db.CertRecord, error)` | reads.go |
 
 ## nonce
@@ -65,6 +69,8 @@
 | `(*RecordBuffer) AddDANonceSync(nonce []byte) error` | record_buffer.go — synchronously fsyncs the WAL before returning (DA nonce crash safety); returns `ErrWALDisabled` without WAL |
 | `(*RecordBuffer) WALEnabled() bool` | record_buffer.go |
 | `(*RecordBuffer) Pending() int32` / `IsFull() bool` / `FlushAll()` / `Stop()` | record_buffer.go |
+| `(*RecordBuffer) WalBytes() int` | record_buffer.go — current WAL size in bytes (R10) |
+| `(*RecordBuffer) FlushStats() (flushed int, bucketCounts []uint64)` | record_buffer.go — flush latency histogram buckets (R10) |
 | `Item` / `ItemKind` (`KindCert`, `KindDANonce`) / `CertItem` / `DANonceItem` | record_buffer.go |
 
 ## Backend Bulk Persistence (db)
@@ -108,5 +114,5 @@
 
 ## Metrics (Prometheus)
 
-- `varwof_engine_certindex_size` / `varwof_engine_revokedset_size` / `varwof_engine_nonceset_size` / **`varwof_engine_danonceset_size`** / `varwof_engine_window_evictions_total` / `varwof_engine_read_hit_total{op}` / `varwof_engine_pipeline_pending` / `varwof_engine_flush_duration_seconds`
-- Added in R8/R10: `varwof_engine_aic_size` / **`varwof_engine_aic_pruned_total`** / **`varwof_engine_cert_issued_total`** / **`varwof_engine_cert_revoked_total`** / **`varwof_engine_cert_resident_bytes`** / **`varwof_engine_aic_resident_bytes`** / **`varwof_engine_wal_bytes`**
+- `varwof_engine_certindex_size` / `varwof_engine_revokedset_size` / `varwof_engine_nonceset_size` / `varwof_engine_danonceset_size` / `varwof_engine_subca_size` / `varwof_engine_trustanchor_size` / `varwof_engine_aic_size` / `varwof_engine_window_evictions_total` / `varwof_engine_read_hit_total` / `varwof_engine_read_miss_total` / `varwof_engine_pipeline_pending` / `varwof_engine_flush_duration_seconds` (histogram)
+- Added in R8/R10: **`varwof_engine_aic_pruned_total`** / **`varwof_engine_cert_issued_total`** / **`varwof_engine_cert_revoked_total`** / **`varwof_engine_cert_resident_bytes`** / **`varwof_engine_aic_resident_bytes`** / **`varwof_engine_wal_bytes`**

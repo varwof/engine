@@ -17,13 +17,13 @@ An in-memory-centric high-speed data subsystem for varwof-core, providing reside
 ## Project Structure
 
 ```
-varwof-engine/
+engine/
 ├── db/                    # SQL backend (extracted from core/internal/db)
 │   ├── db.go              # DB wrapper + 3-way dialect rebind/adapt + connection pool tuning
 │   ├── dialect.go         # Dialect interface (SQLite/PG/MySQL)
 │   ├── schema.go          # migration v1 (consolidated schema) + dialect placeholder adaptation
 │   ├── certs.go           # CertRecord full-field CRUD + status lookup + SPKI/principal/CRL
-│   ├── batch.go           # BulkInsertCertRecords (999-variable chunking; ~2K/s on TF card, higher on SSD)
+│   ├── batch.go           # BulkInsertCertRecords (999-variable chunking; ~2K/s on SD card, higher on SSD)
 │   ├── renewal_tokens.go  # nonce Store/Consume/IsUsed (one-time anti-replay)
 │   ├── aic.go             # AIC extensions (ca,serial / principal / agent)
 │   ├── sub_ca.go          # Sub-CA
@@ -31,7 +31,10 @@ varwof-engine/
 │   ├── ca_meta.go / cross.go / ct.go / escrow.go / gateway_registry.go
 │   ├── rbac.go / ra.go / webhook.go / scep.go / acme.go / audit_salt.go / transfer.go
 │   ├── lock.go            # Distributed lock (PG advisory + platform file lock)
-│   └── lock_file_unix.go
+│   ├── lock_file_unix.go
+│   ├── create.go          # CreateDatabaseIfNotExists (per-dialect)
+│   ├── crl_number.go / da_nonces.go / bulk_revoke.go
+│   └── ... (33 test files)
 ├── recordbuffer/          # Write pipeline (extracted from core/internal/serve/record_buffer.go)
 │   └── record_buffer.go   # WAL pre-write log + backpressure + checkpoint + drain + FlushAll
 ├── cache/                 # Unified read cache (extracted from ocsp/serve/cmd)
@@ -44,8 +47,7 @@ varwof-engine/
 │   ├── nonce_set.go       # NonceSet (one-time CAS)
 │   ├── meta_index.go      # SubCA / Trust / AIC indexes
 │   ├── reads.go / writes.go / load.go / janitor.go
-│   ├── engine_test.go / engine_coverage_test.go / convergence_test.go
-│   ├── engine_edge_test.go / revoked_set_test.go / engine_bench_test.go
+│   └── ... (16 test files incl. bench/scale/fuzz)
 ├── docs/
 │   ├── zh/                # 中文文档
 │   │   ├── REQUIREMENTS.md
@@ -61,7 +63,8 @@ varwof-engine/
 │   ├── config.md          # EngineOptions configuration
 │   ├── functions.md       # Function index
 │   ├── TESTING.md         # Test inventory / coverage / concurrency & fuzz conventions
-│   └── NEXT_STEPS.md      # Remaining work (blocked items / uncovered branches / candidate optimizations)
+│   ├── NEXT_STEPS.md      # Remaining work (blocked items / uncovered branches / candidate optimizations)
+│   └── BENCHMARK_COMPARISON.md  # 3-machine benchmark comparison (desktop / Pi 5 / PN41)
 └── README.md
 ```
 
@@ -69,13 +72,13 @@ varwof-engine/
 
 ```bash
 # Verify the extracted implementation
-cd engine && go test -count=1 ./...
+go test -count=1 ./...
 
 # CI runs automatically on every push/PR via GitHub Actions
 # (build / vet / race tests / coverage gate >=85% / real PostgreSQL & MariaDB integration)
 
 # Standalone build (no go.work / replace; mount via go.work in varwof-core repo root after integration)
-cd engine && go build ./...
+go build ./...
 ```
 
 ## Design Highlights
@@ -88,13 +91,13 @@ cd engine && go build ./...
 
 ## Benchmarks
 
-19 benchmarks total in `engine/engine_bench_test.go`, `recordbuffer/recordbuffer_bench_test.go`, `cache/cache_bench_test.go`.
+34 benchmarks total across `engine/` (including `engine_bench_test.go`, `aic_sim_bench_test.go`, `evict_bench_test.go`, `multica_bench_test.go`, `scale_bench_test.go`), `recordbuffer/recordbuffer_bench_test.go`, `cache/cache_bench_test.go`.
 
 ```bash
 # Full benchmark run (recordbuffer/cache/engine, ~2-3 minutes)
 go test ./recordbuffer/ ./cache/ ./engine/ -bench . -benchmem -benchtime=300ms -run '^$'
 
-# Include db package (slow on TF card)
+# Include db package (slow)
 go test ./db/ -bench . -benchmem -benchtime=300ms -run '^$'
 
 # Single benchmark (-benchmem outputs bytes/allocs per op)
@@ -115,6 +118,8 @@ Key baselines (Intel Core Ultra 5 125H / x86_64 / Go 1.26.7, `-benchtime=300ms`)
 | `BenchmarkRecordBufferAddWAL` | ~18µs/op (fsync every 100 records) |
 | `BenchmarkCacheGetHit` | Hit ~212ns, read-lock path (parallel hits don't serialize) |
 | `BenchmarkCacheSetAtCapacity` | Capacity-full eviction ~336ns/op |
+
+See [docs/BENCHMARK_COMPARISON.md](docs/BENCHMARK_COMPARISON.md) for a 3-machine comparison (desktop / Raspberry Pi 5 / PN41).
 
 ## License
 

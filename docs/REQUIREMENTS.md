@@ -144,7 +144,7 @@ varwof-core's current data layer exhibits the following structural contradiction
 
 ### 4.4 External Interface (New API for varwof-core)
 
-**FR-9 Proposed Engine API (converged at implementation per varwof-core call sites, see `docs/en/IMPLEMENTATION_PLAN.md`)**
+**FR-9 Proposed Engine API (converged at implementation per varwof-core call sites, see `docs/IMPLEMENTATION_PLAN.md`)**
 
 ```go
 type Engine struct { ... }

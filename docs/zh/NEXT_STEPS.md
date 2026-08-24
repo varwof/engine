@@ -35,20 +35,20 @@ R6/R9 跑 `-race` 时暴露 `recordbuffer` 真实竞态：`bufio.Writer` + WAL `
 | Phase G：varwof-core 渐进迁移（`IMPLEMENTATION_PLAN.md` Phase G 1-6） | varwof-core 仓库不存在 | 待接入 |
 | 崩溃恢复端到端验证（kill -9 → 重启 → WAL 回放 → 内存索引完整） | 需 varwof-core 集成环境；engine 侧已由 `TestEngineRebuildFullState` / `TestConvergenceMemoryAuthoritative` 覆盖 | 待集成环境 |
 | MySQL/MariaDB 真库验证 | 已完成（2026-08-10 + 2026-08-20）：本机 MariaDB 10.11。2026-08-20 改用 3306 系统实例（`varwof` 用户已建）跑 `-tags mysql`，新增 `TestMySQLBulkStoreDANonces` / `TestMySQLBulkRevokeCertificates`（R1/R3 方言分支真库验证），全套件全绿 | ✅ 已完成 |
-| `go test -race ./...` | 本机 arm64 内核 ASLR 熵固定 39bit（TSan 需 ≤32，`vm.mmap_rnd_bits` sysctl 拒绝下调，需重编内核）；并发测试已设计为 CI 可跑 `-race`。此前的吊销竞态已修复（见「吊销路径数据竞态已修复」）；engine 套件本机 `-race` 全绿 | 待 CI |
+| `go test -race ./...` | 并发测试在本地与 CI（`.github/workflows/ci.yml`）`-race` 下全绿；此前的吊销竞态已修复（见「吊销路径数据竞态已修复」） | ✅ 已完成 |
 | CI workflow（test + vet + race + 覆盖率门禁） | ✅ 已完成（2026-08-24）：`.github/workflows/ci.yml`（build/vet/test/race/覆盖率门禁 85%/PG 与 MariaDB 真库服务容器） | ✅ 已完成 |
 
 > **PostgreSQL 已就绪**（2026-08-10 + 2026-08-20）：本机 PG 15 在线。2026-08-20 创建 `varwof` 角色（`$PASSWORD`）+ `pki` 数据库 + `CREATEDB`，`PG_TEST_DSN="postgres://varwof:$PASSWORD@localhost:5432/pki?sslmode=disable"`。
 > PG 门控用例：`go test -tags postgres ./db/ -run 'TestPGConnect|TestPGAdvisoryLockReal|TestPGTransferToReal|TestCreatePGDatabaseReal|TestPGBulkStoreDANonces|TestPGBulkRevokeCertificates'`。
-> 覆盖全量迁移、advisory lock 真库、`TransferTo` 的 pgx 序列更新分支、R1/R3 方言分支（db 覆盖率 85.6% → 86.5%）。
+> 覆盖全量迁移、advisory lock 真库、`TransferTo` 的 pgx 序列更新分支、R1/R3 方言分支（db 覆盖率 83.5% → 86.5%（含 PG 真库））。
 > 真库测试暴露并修复了 `NewDistLock` 类型断言 bug（`d.dialect.(pgDialect)` 匹配不到 `*pgDialectWithConfig`）。
 
 > **MariaDB 已就绪**（2026-08-10 + 2026-08-20）：本机 3306 系统实例（2026-08-10 记录的 3307 隔离实例未运行）。
 > `MYSQL_TEST_DSN="varwof:$PASSWORD@tcp(127.0.0.1:3306)/pki_mysql?charset=utf8mb4&parseTime=true" go test -tags mysql ./db/`。
-> 覆盖全量迁移、证书 CRUD roundtrip、999 变量分块 bulk（2000 条）、`TransferTo` 通用路径、R1/R3 方言分支（db 覆盖率 85.6% → 86.1%）。
+> 覆盖全量迁移、证书 CRUD roundtrip、999 变量分块 bulk（2000 条）、`TransferTo` 通用路径、R1/R3 方言分支（db 覆盖率 83.5% → 86.1%（含 MySQL 真库））。
 > 注意：MariaDB 的 `NewDistLock` 走文件锁（仅 PG 走 advisory lock）。
 
-## 覆盖率剩余未覆盖（engine 99.0% / db 86.5%）
+## 覆盖率剩余未覆盖（engine 97.0% / db 83.5% / cache 99.1% / recordbuffer 81.6%）
 
 | 位置 | 说明 | 能否覆盖 |
 |---|---|---|
@@ -66,11 +66,10 @@ R6/R9 跑 `-race` 时暴露 `recordbuffer` 真实竞态：`bufio.Writer` + WAL `
 - [ ] 高并发下 `RecordBuffer.Add` 与 `IsFull` 竞态的确定性构造测试
 - [ ] `TransferTo` 目标为非空库 / 幂等重入测试
 
-## 环境注意事项（本机树莓派 4B）
+## 环境注意事项（2026-08-24 于 Intel Core Ultra 5 125H 桌面机实测）
 
-- TF 卡慢：`go test -fuzz` 必须先跑完整包测试再 fuzz，db 包 ~60-90s 曾致 120s 超时。**fuzz 必须加 `-run='^$'`**。
-- `go test -race` 不可用（见上）。
-- 基准数字为硬件相关，重测需在同一环境下对比；README「基准」表定期重测更新（`go test ./... -bench . -benchmem` 直接运行）。
+- `go test -race` 在本地与 CI（GitHub Actions）均正常。
+- 基准数字为硬件相关，重测需在同一环境下对比；README「基准」表定期重测更新（`go test ./... -bench . -benchmem` 直接运行）。三机对比（桌面 / 树莓派 5 / PN41）见 `docs/BENCHMARK_COMPARISON.md`。
 
 ## 代码审查规则（写路径路由）
 

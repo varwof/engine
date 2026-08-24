@@ -13,6 +13,7 @@
 | `(*Engine) FlushAll() error` | engine.go |
 | `(*Engine) Loading() bool` | engine.go |
 | `(*Engine) DB() *db.DB` | engine.go |
+| `(*Engine) SetDB(d *db.DB)` | engine.go |
 
 ## Certificate Read
 
@@ -32,6 +33,7 @@
 |---|---|
 | `(*Engine) IssueCert(rec *db.CertRecord) error` | writes.go |
 | `(*Engine) RevokeCert(caName, serial string, reason int) error` | writes.go |
+| `(*Engine) RevokeCertsBatch(entries []RevokeBatchEntry) (int, []RevokeBatchEntry, error)` | writes.go |
 | `(*Engine) RevokeCertsByPrincipalUid(uid string, reason int) (int, error)` | writes.go |
 | `(*Engine) RevokeCertsBySubCA(caName string, reason int) (int, error)` | writes.go |
 
@@ -40,6 +42,7 @@
 | Function | File |
 |---|---|
 | `(*Engine) GetRevokedCertEntries(caName string) ([]*db.RevokedCertEntry, error)` | reads.go |
+| `(*Engine) GetRevokedCertEntriesSince(caName string, since time.Time) ([]*db.RevokedCertEntry, error)` | reads.go |
 | `(*Engine) GetRevokedCerts(caName string) ([]*db.CertRecord, error)` | reads.go |
 
 ## nonce
@@ -65,6 +68,8 @@
 | `(*RecordBuffer) AddDANonceSync(nonce []byte) error` | record_buffer.go — WAL-fsyncs before returning (crash-safe DA nonce); `ErrWALDisabled` when no WAL |
 | `(*RecordBuffer) WALEnabled() bool` | record_buffer.go |
 | `(*RecordBuffer) Pending() int32` / `IsFull() bool` / `FlushAll()` / `Stop()` | record_buffer.go |
+| `(*RecordBuffer) WalBytes() int` | record_buffer.go — current WAL size in bytes (R10) |
+| `(*RecordBuffer) FlushStats() (flushed int, bucketCounts []uint64)` | record_buffer.go — flush latency histogram buckets (R10) |
 | `Item` / `ItemKind` (`KindCert`, `KindDANonce`) / `CertItem` / `DANonceItem` | record_buffer.go |
 
 ## Backend Batch Sinks (db)
@@ -96,7 +101,7 @@
 
 ## Types & Errors
 
-- `EngineOptions` (engine/options.go) → see `docs/en/config.md`
+- `EngineOptions` (engine/options.go) → see `docs/config.md`
 - `Metrics` (engine/engine.go) — includes `CertIssued` / `CertRevoked` / `AICPruned` counters, `CertResidentBytes` / `AICResidentBytes` (R8), `WalBytes`, `FlushDuration` histogram (R10)
 - `CertCursor` (engine/cert_index.go) — opaque pagination cursor for high-cardinality certificate queries; encodes the (NotBefore desc, serial desc) position of the last returned record. Pass back as the `after` argument to fetch the next page; nil starts at the beginning.
 - Errors: `ErrNotFound`, `ErrDuplicate`, `ErrBackpressure` (engine.go)
@@ -108,5 +113,5 @@
 
 ## Prometheus Metrics
 
-- `varwof_engine_certindex_size` / `varwof_engine_revokedset_size` / `varwof_engine_nonceset_size` / **`varwof_engine_danonceset_size`** / `varwof_engine_window_evictions_total` / `varwof_engine_read_hit_total{op}` / `varwof_engine_pipeline_pending` / `varwof_engine_flush_duration_seconds`
-- R8/R10 additions: `varwof_engine_aic_size` / **`varwof_engine_aic_pruned_total`** / **`varwof_engine_cert_issued_total`** / **`varwof_engine_cert_revoked_total`** / **`varwof_engine_cert_resident_bytes`** / **`varwof_engine_aic_resident_bytes`** / **`varwof_engine_wal_bytes`**
+- `varwof_engine_certindex_size` / `varwof_engine_revokedset_size` / `varwof_engine_nonceset_size` / `varwof_engine_danonceset_size` / `varwof_engine_subca_size` / `varwof_engine_trustanchor_size` / `varwof_engine_aic_size` / `varwof_engine_window_evictions_total` / `varwof_engine_read_hit_total` / `varwof_engine_read_miss_total` / `varwof_engine_pipeline_pending` / `varwof_engine_flush_duration_seconds` (histogram)
+- R8/R10 additions: **`varwof_engine_aic_pruned_total`** / **`varwof_engine_cert_issued_total`** / **`varwof_engine_cert_revoked_total`** / **`varwof_engine_cert_resident_bytes`** / **`varwof_engine_aic_resident_bytes`** / **`varwof_engine_wal_bytes`**

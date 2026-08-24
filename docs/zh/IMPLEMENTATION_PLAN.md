@@ -14,12 +14,12 @@ varwof-engine/
   docs/
     REQUIREMENTS.md
     IMPLEMENTATION_PLAN.md
-  go.mod / go.work（已挂载）
+  go.mod
 ```
 
 验证命令：
 ```bash
-cd engine && go test -count=1 ./...
+go test -count=1 ./...
 ```
 
 ## 1. 实施顺序（建议）
@@ -98,8 +98,8 @@ cd engine && go test -count=1 ./...
 ## 3. 验收标准
 
 - [x] `varwof-engine` 独立模块 build + vet + test 全绿（含并发测试）。
-- [x] 全部 FR-1..FR-9 实现；REQUIREMENTS NFR-1 性能目标达成（基准对比，见 `engine_bench_test.go` 基线：GetCertStatus ~160–300ns、IssueCert 内存 ~14µs、ConsumeNonce 并发 CAS）。
-- [x] 测试与覆盖率记录在 `docs/TESTING.md`（cache 99.1% / engine 99.0% / db 86.5% 含 PG 真库 / recordbuffer 90.7%）；剩余工作清单见 `docs/NEXT_STEPS.md`。
+- [x] 全部 FR-1..FR-9 实现；REQUIREMENTS NFR-1 性能目标达成（基准对比，见 `engine_bench_test.go` 基线：GetCertStatus ~230ns、IssueCert 内存 ~7.2µs、ConsumeNonce 并发 CAS）。
+- [x] 测试与覆盖率记录在 `docs/TESTING.md`（cache 99.1% / engine 97.0% / db 83.5% 含 PG 真库 86.5% / recordbuffer 81.6%）；剩余工作清单见 `docs/NEXT_STEPS.md`。
 - [x] `OnCertRevoked` 精确失效路径生效（握手缓存 + OCSP LRU）——经 `EngineOptions.OnCertRevoked` 回调，varwof-core 接入后挂接。
 - [ ] 崩溃恢复：kill -9 → 重启 → WAL 回放 → 内存索引完整（已由 `recordbuffer` WAL 承担；engine 全量重建由 `TestEngineRebuildFullState` 覆盖已吊销/已用 nonce/subCA/信任锚/AIC 路径，`TestConvergenceMemoryAuthoritative` 覆盖内存权威 + 后端有序收敛；端到端验证待 varwof-core 集成环境）。
 - [ ] varwof-core 渐进迁移后全量 `go test -count=1 -short ./...` 全绿，无手动 flush 约定残留（待 Phase G）。

@@ -13,6 +13,7 @@
 | `(*Engine) FlushAll() error` | engine.go |
 | `(*Engine) Loading() bool` | engine.go |
 | `(*Engine) DB() *db.DB` | engine.go |
+| `(*Engine) SetDB(d *db.DB)` | engine.go |
 
 ## 证书读
 
@@ -32,6 +33,7 @@
 |---|---|
 | `(*Engine) IssueCert(rec *db.CertRecord) error` | writes.go |
 | `(*Engine) RevokeCert(caName, serial string, reason int) error` | writes.go |
+| `(*Engine) RevokeCertsBatch(entries []RevokeBatchEntry) (int, []RevokeBatchEntry, error)` | writes.go |
 | `(*Engine) RevokeCertsByPrincipalUid(uid string, reason int) (int, error)` | writes.go |
 | `(*Engine) RevokeCertsBySubCA(caName string, reason int) (int, error)` | writes.go |
 
@@ -40,6 +42,7 @@
 | 函数 | 所在文件 |
 |---|---|
 | `(*Engine) GetRevokedCertEntries(caName string) ([]*db.RevokedCertEntry, error)` | reads.go |
+| `(*Engine) GetRevokedCertEntriesSince(caName string, since time.Time) ([]*db.RevokedCertEntry, error)` | reads.go |
 | `(*Engine) GetRevokedCerts(caName string) ([]*db.CertRecord, error)` | reads.go |
 
 ## nonce
@@ -65,6 +68,8 @@
 | `(*RecordBuffer) AddDANonceSync(nonce []byte) error` | record_buffer.go — 返回前同步 fsync WAL（DA nonce 崩溃安全）；无 WAL 返回 `ErrWALDisabled` |
 | `(*RecordBuffer) WALEnabled() bool` | record_buffer.go |
 | `(*RecordBuffer) Pending() int32` / `IsFull() bool` / `FlushAll()` / `Stop()` | record_buffer.go |
+| `(*RecordBuffer) WalBytes() int` | record_buffer.go — 当前 WAL 字节数（R10） |
+| `(*RecordBuffer) FlushStats() (flushed int, bucketCounts []uint64)` | record_buffer.go — flush 延迟直方图分桶（R10） |
 | `Item` / `ItemKind`（`KindCert`、`KindDANonce`）/ `CertItem` / `DANonceItem` | record_buffer.go |
 
 ## 后端批量落库（db）
@@ -108,5 +113,5 @@
 
 ## 指标（Prometheus）
 
-- `varwof_engine_certindex_size` / `varwof_engine_revokedset_size` / `varwof_engine_nonceset_size` / **`varwof_engine_danonceset_size`** / `varwof_engine_window_evictions_total` / `varwof_engine_read_hit_total{op}` / `varwof_engine_pipeline_pending` / `varwof_engine_flush_duration_seconds`
-- R8/R10 新增：`varwof_engine_aic_size` / **`varwof_engine_aic_pruned_total`** / **`varwof_engine_cert_issued_total`** / **`varwof_engine_cert_revoked_total`** / **`varwof_engine_cert_resident_bytes`** / **`varwof_engine_aic_resident_bytes`** / **`varwof_engine_wal_bytes`**
+- `varwof_engine_certindex_size` / `varwof_engine_revokedset_size` / `varwof_engine_nonceset_size` / `varwof_engine_danonceset_size` / `varwof_engine_subca_size` / `varwof_engine_trustanchor_size` / `varwof_engine_aic_size` / `varwof_engine_window_evictions_total` / `varwof_engine_read_hit_total` / `varwof_engine_read_miss_total` / `varwof_engine_pipeline_pending` / `varwof_engine_flush_duration_seconds`（直方图）
+- R8/R10 新增：**`varwof_engine_aic_pruned_total`** / **`varwof_engine_cert_issued_total`** / **`varwof_engine_cert_revoked_total`** / **`varwof_engine_cert_resident_bytes`** / **`varwof_engine_aic_resident_bytes`** / **`varwof_engine_wal_bytes`**

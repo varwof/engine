@@ -17,13 +17,13 @@
 ## Project Structure
 
 ```
-varwof-engine/
+engine/
 ├── db/                    # SQL 后端层（从 core/internal/db 提取）
 │   ├── db.go              # DB wrapper + 三方言 rebind/adapt + 连接池调优
 │   ├── dialect.go         # Dialect 接口（SQLite/PG/MySQL）
 │   ├── schema.go          # migration v1 (consolidated schema) + 方言占位符适配
 │   ├── certs.go           # CertRecord 全字段 CRUD + 状态点查 + SPKI/principal/CRL
-│   ├── batch.go           # BulkInsertCertRecords（999 变量分块；本机 TF 卡实测 ~2K/s，SSD 更高）
+│   ├── batch.go           # BulkInsertCertRecords（999 变量分块；SD 卡实测 ~2K/s，SSD 更高）
 │   ├── renewal_tokens.go  # nonce Store/Consume/IsUsed（一次性防重放）
 │   ├── aic.go             # AIC 扩展（ca,serial / principal / agent）
 │   ├── sub_ca.go          # 子 CA
@@ -31,7 +31,10 @@ varwof-engine/
 │   ├── ca_meta.go / cross.go / ct.go / escrow.go / gateway_registry.go
 │   ├── rbac.go / ra.go / webhook.go / scep.go / acme.go / audit_salt.go / transfer.go
 │   ├── lock.go            # 分布式锁（PG advisory + 平台文件锁）
-│   └── lock_file_unix.go
+│   ├── lock_file_unix.go
+│   ├── create.go          # CreateDatabaseIfNotExists（各方言）
+│   ├── crl_number.go / da_nonces.go / bulk_revoke.go
+│   └── ...（33 个测试文件）
 ├── recordbuffer/          # 写管道（从 core/internal/serve/record_buffer.go 提取）
 │   └── record_buffer.go   # WAL 预写日志 + 背压 + checkpoint + drain + FlushAll
 ├── cache/                 # 统一读缓存（从 ocsp/serve/cmd 提取合并）
@@ -44,8 +47,7 @@ varwof-engine/
 │   ├── nonce_set.go       # NonceSet（一次性 CAS）
 │   ├── meta_index.go      # SubCA / Trust / AIC 索引
 │   ├── reads.go / writes.go / load.go / janitor.go
-│   ├── engine_test.go / engine_coverage_test.go / convergence_test.go
-│   ├── engine_edge_test.go / revoked_set_test.go / engine_bench_test.go
+│   └── ...（16 个测试文件，含 bench/规模/fuzz）
 ├── docs/
 │   ├── zh/                # 中文文档
 │   │   ├── REQUIREMENTS.md
@@ -61,7 +63,8 @@ varwof-engine/
 │   ├── config.md          # 英文 EngineOptions 配置
 │   ├── functions.md       # 英文函数索引
 │   ├── TESTING.md         # 英文测试清单
-│   └── NEXT_STEPS.md      # 英文剩余工作清单
+│   ├── NEXT_STEPS.md      # 英文剩余工作清单
+│   └── BENCHMARK_COMPARISON.md  # 三机基准对比（桌面 / Pi 5 / PN41）
 └── README.md
 ```
 
@@ -69,13 +72,13 @@ varwof-engine/
 
 ```bash
 # 验证提取的现状实现
-cd engine && go test -count=1 ./...
+go test -count=1 ./...
 
 # CI 由 GitHub Actions 在每次 push/PR 自动执行
 # （build / vet / race 测试 / 覆盖率门禁 >=85% / PostgreSQL 与 MariaDB 真库集成）
 
 # 本模块独立构建（无 go.work / replace，varwof-core 接入后在其仓库根建 go.work 挂载）
-cd engine && go build ./...
+go build ./...
 ```
 
 ## 设计要点
@@ -88,13 +91,13 @@ cd engine && go build ./...
 
 ## 基准
 
-全部基准共 19 个，位于 `engine/engine_bench_test.go`、`recordbuffer/recordbuffer_bench_test.go`、`cache/cache_bench_test.go`。
+全部基准共 34 个，分布于 `engine/`（含 `engine_bench_test.go`、`aic_sim_bench_test.go`、`evict_bench_test.go`、`multica_bench_test.go`、`scale_bench_test.go`）、`recordbuffer/recordbuffer_bench_test.go`、`cache/cache_bench_test.go`。
 
 ```bash
 # 单次全量基准（recordbuffer/cache/engine，~2-3 分钟）
 go test ./recordbuffer/ ./cache/ ./engine/ -bench . -benchmem -benchtime=300ms -run '^$'
 
-# 加 db 包（TF 卡上很慢）
+# 加 db 包（较慢）
 go test ./db/ -bench . -benchmem -benchtime=300ms -run '^$'
 
 # 单个基准（-benchmem 输出每次分配的字节/对象数）
@@ -115,6 +118,8 @@ go test ./engine/ -bench '^BenchmarkGetCertStatus$' -benchmem -run '^$'
 | `BenchmarkRecordBufferAddWAL` | ~18µs/条（每 100 条 fsync 一次） |
 | `BenchmarkCacheGetHit` | 命中 ~212ns，读锁路径（并行命中不串行） |
 | `BenchmarkCacheSetAtCapacity` | 容量满逐出 ~336ns/次 |
+
+三机对比（桌面 / 树莓派 5 / PN41）见 [docs/BENCHMARK_COMPARISON.md](docs/BENCHMARK_COMPARISON.md)。
 
 ## License
 

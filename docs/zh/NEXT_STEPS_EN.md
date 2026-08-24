@@ -35,20 +35,20 @@ Running R6/R9 under `-race` exposed a real `recordbuffer` race: `bufio.Writer` +
 | Phase G: varwof-core gradual migration (`IMPLEMENTATION_PLAN.md` Phase G 1-6) | varwof-core repository does not exist | Pending integration |
 | Crash recovery end-to-end verification (kill -9 → restart → WAL replay → intact memory indexes) | Requires varwof-core integration environment; engine side already covered by `TestEngineRebuildFullState` / `TestConvergenceMemoryAuthoritative` | Awaiting integration environment |
 | MySQL/MariaDB real-database verification | Complete (2026-08-10 + 2026-08-20): local MariaDB 10.11. On 2026-08-20 switched to the 3306 system instance (`varwof` user created) to run `-tags mysql`; added `TestMySQLBulkStoreDANonces` / `TestMySQLBulkRevokeCertificates` (real-DB verification of R1/R3 dialect branches), full suite green | ✅ Done |
-| `go test -race ./...` | Local arm64 kernel ASLR entropy fixed at 39bit (TSan needs ≤32; `vm.mmap_rnd_bits` sysctl refuses lowering; kernel rebuild required); concurrency tests designed so CI can run `-race`. The earlier revocation race has been fixed (see "Revocation Path Data Race Fixed"); engine suite fully green locally under `-race` | Awaiting CI |
+| `go test -race ./...` | Concurrency tests run clean under `-race` locally and in CI (`.github/workflows/ci.yml`); earlier revocation race fixed (see "Revocation Path Data Race Fixed") | ✅ Done |
 | CI workflow (test + vet + race + coverage gate) | ✅ Done (2026-08-24): `.github/workflows/ci.yml` (build/vet/test/race/coverage gate 85%/real PG & MariaDB service containers) | ✅ Done |
 
 > **PostgreSQL ready** (2026-08-10 + 2026-08-20): local PG 15 online. On 2026-08-20 created the `varwof` role (`$PASSWORD`) + `pki` database + `CREATEDB`, `PG_TEST_DSN="postgres://varwof:$PASSWORD@localhost:5432/pki?sslmode=disable"`.
 > PG-gated cases: `go test -tags postgres ./db/ -run 'TestPGConnect|TestPGAdvisoryLockReal|TestPGTransferToReal|TestCreatePGDatabaseReal|TestPGBulkStoreDANonces|TestPGBulkRevokeCertificates'`.
-> Covers full migration, advisory lock against a real DB, `TransferTo`'s pgx sequence-update branch, R1/R3 dialect branches (db coverage 85.6% → 86.5%).
+> Covers full migration, advisory lock against a real DB, `TransferTo`'s pgx sequence-update branch, R1/R3 dialect branches (db coverage 83.5% → 86.5% with PG real DB).
 > Real-database testing exposed and fixed a `NewDistLock` type-assertion bug (`d.dialect.(pgDialect)` fails to match `*pgDialectWithConfig`).
 
 > **MariaDB ready** (2026-08-10 + 2026-08-20): local 3306 system instance (the 3307 isolated instance recorded on 2026-08-10 was not running).
 > `MYSQL_TEST_DSN="varwof:$PASSWORD@tcp(127.0.0.1:3306)/pki_mysql?charset=utf8mb4&parseTime=true" go test -tags mysql ./db/`.
-> Covers full migration, certificate CRUD roundtrip, 999-variable chunked bulk (2000 records), `TransferTo` generic path, R1/R3 dialect branches (db coverage 85.6% → 86.1%).
+> Covers full migration, certificate CRUD roundtrip, 999-variable chunked bulk (2000 records), `TransferTo` generic path, R1/R3 dialect branches (db coverage 83.5% → 86.1% with MySQL real DB).
 > Note: MariaDB's `NewDistLock` uses file locks (only PG uses advisory locks).
 
-## Coverage Remaining Uncovered (engine 99.0% / db 86.5%)
+## Coverage Remaining Uncovered (engine 97.0% / db 83.5% / cache 99.1% / recordbuffer 81.6%)
 
 | Location | Description | Coverable? |
 |---|---|---|
@@ -66,11 +66,10 @@ Running R6/R9 under `-race` exposed a real `recordbuffer` race: `bufio.Writer` +
 - [ ] Deterministic test constructing the `RecordBuffer.Add` vs `IsFull` race under high concurrency
 - [ ] `TransferTo` tests targeting non-empty databases / idempotent re-entry
 
-## Environment Notes (local Raspberry Pi 4B)
+## Environment Notes (measured on Intel Core Ultra 5 125H desktop, 2026-08-24)
 
-- TF card is slow: `go test -fuzz` must run the full package tests before fuzzing; the db package takes ~60-90s which once caused a 120s timeout. **Fuzz must add `-run='^$'`**.
-- `go test -race` unavailable (see above).
-- Benchmark numbers are hardware-dependent; re-test within the same environment for comparison; README "Benchmarks" table refreshed periodically (run `go test ./... -bench . -benchmem` directly).
+- `go test -race` runs clean locally and in CI (GitHub Actions).
+- Benchmark numbers are hardware-dependent; re-test within the same environment for comparison; README "Benchmarks" table refreshed periodically (run `go test ./... -bench . -benchmem` directly). 3-machine comparison (desktop / Raspberry Pi 5 / PN41) in `docs/BENCHMARK_COMPARISON.md`.
 
 ## Code Review Rules (write-path routing)
 

@@ -14,6 +14,7 @@ func (e *Engine) Stop()           // 排空写管道并停止后台协程
 func (e *Engine) FlushAll() error // 同步排空（运维/吊销兜底，常规无需调用）
 func (e *Engine) Loading() bool   // 启动重建是否完成
 func (e *Engine) DB() *db.DB      // 底层后端句柄
+func (e *Engine) SetDB(d *db.DB)  // 更换后端句柄（如重开/迁移后）
 ```
 
 使用顺序：`NewEngine`（内部完成全量重建）→ `Start()`（可选，开启过期剪枝）→ 业务调用 → `Stop()`。
@@ -25,10 +26,12 @@ func (e *Engine) DB() *db.DB      // 底层后端句柄
 | `GetCert(caName, serial string) (*db.CertRecord, error)` | 全字段点查（含 CertDER） |
 | `GetCertStatus(caName, serial string) (*db.CertStatus, error)` | OCSP / 握手吊销轻量状态 |
 | `GetCertStatusByIssuer(issuerDN, serial string) (*db.CertStatus, error)` | 按 issuer DN + serial 点查 |
-| `GetCertBySPKIHash(spkiHash, caName, status string) ([]*db.CertRecord, error)` | SPKI 关联查询，可按 CA/状态过滤 |
-| `ListCertsByPrincipalUid(uid, status string) ([]*db.CertRecord, error)` | 按人列举 |
-| `ListCertsByAgentID(agent, status string) ([]*db.CertRecord, error)` | 按 agent 列举 |
+| `GetCertBySPKIHash(spkiHash, caName, status string, limit int, after *CertCursor) (recs []*db.CertRecord, next *CertCursor, hasMore bool, err error)` | SPKI 关联分页查询，可按 CA/状态过滤 |
+| `ListCertsByPrincipalUid(uid, status string, limit int, after *CertCursor) (recs []*db.CertRecord, next *CertCursor, hasMore bool, err error)` | 按人分页列举 |
+| `ListCertsByAgentID(agent, status string, limit int, after *CertCursor) (recs []*db.CertRecord, next *CertCursor, hasMore bool, err error)` | 按 agent 分页列举 |
 | `CheckDuplicateCN(caName, cn string, nb, na time.Time) error` | 活跃证书重复 CN + 时间重叠检查 |
+
+分页查询（`GetCertBySPKIHash` / `ListCertsByPrincipalUid` / `ListCertsByAgentID`）接受 `limit` 与不透明 `*CertCursor`；把返回的 `next` 游标作为 `after` 取下一页（nil 从头开始），`hasMore` 指示是否还有更多。排序为（NotBefore desc, serial desc）。
 
 未命中返回 `engine.ErrNotFound`。OCSP 语义（V 且已过期 → Unknown）由调用方结合 `CertStatus.NotAfter` 应用；引擎仅保证 `not_after < now - grace` 的证书已移出热内存。
 
@@ -38,6 +41,7 @@ func (e *Engine) DB() *db.DB      // 底层后端句柄
 |---|---|
 | `IssueCert(rec *db.CertRecord) error` | 先写内存（立即可读），再入 WAL 保护写管道。同 (ca,serial) 同 fingerprint 幂等；不同 fingerprint 返回 `db.ErrDuplicateSerial`；管道满返回 `engine.ErrBackpressure`（上层应回 503） |
 | `RevokeCert(caName, serial string, reason int) error` | 内存原子置 R → 回调 `OnCertRevoked` → 内部先 flush 再排队 UPDATE（顺序保证，无需上层手动 flush） |
+| `RevokeCertsBatch(entries []RevokeBatchEntry) (int, []RevokeBatchEntry, error)` | 批量吊销（单语句），返回数量 + 失败条目 |
 | `RevokeCertsByPrincipalUid(uid string, reason int) (int, error)` | 批量吊销，返回数量 |
 | `RevokeCertsBySubCA(caName string, reason int) (int, error)` | 批量吊销某子 CA 签发的证书，返回数量 |
 
@@ -46,6 +50,7 @@ func (e *Engine) DB() *db.DB      // 底层后端句柄
 | 方法 | 说明 |
 |---|---|
 | `GetRevokedCertEntries(caName string) ([]*db.RevokedCertEntry, error)` | 有效窗口内吊销条目，按 revoked_at 倒序（CRL 生成） |
+| `GetRevokedCertEntriesSince(caName string, since time.Time) ([]*db.RevokedCertEntry, error)` | 同上，仅返回 `since` 之后吊销的条目（增量/差异 CRL） |
 | `GetRevokedCerts(caName string) ([]*db.CertRecord, error)` | 同上，返回完整记录 |
 
 ## nonce（一次性防重放）
@@ -105,7 +110,7 @@ func (e *Engine) PrometheusMetrics() string              // Prometheus 文本格
 - **内存即真相**：写后立即读命中内存，无 ≤500ms 可见性窗口。
 - **并发安全**：`IssueCert` 的同键冲突判定与插入在索引锁内原子完成（并发同 (ca,serial) 不同指纹签发仅一个成功）；批量吊销（`RevokeCertsByPrincipalUid` / `RevokeCertsBySubCA`）的状态变更也在索引锁内进行，与并发点查无数据竞争，吊销集以单次排序合并（O(n log n)），避免逐条插入的 O(n²)。
 - **吊销顺序保证**：`RevokeCert` 内部先排空写管道再排队 `UPDATE`，保证后端不会出现「已吊销但证书仍为 V」的竞态。上层不再需要手动 `FlushRecordBuffer()`。
-- **崩溃恢复**：内存索引丢失 → 启动全量重建；`WalPath` 只保护写管道中未落库的证书批次。
+- **崩溃恢复**：内存索引丢失 → 启动全量重建；`WalPath` 保护写管道中未落库的**证书批次与 DA nonce**（R2）。
 - **后端收敛**：落库幂等（`INSERT OR IGNORE` / `ON CONFLICT DO NOTHING` / `INSERT IGNORE`）。
 
 ## 写管道并发保证

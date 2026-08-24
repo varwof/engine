@@ -1,7 +1,7 @@
 # varwof-engine Implementation Plan (IMPLEMENTATION_PLAN)
 
 > Audience: AI / engineers responsible for implementing the in-memory engine.
-> Prerequisite: read `docs/en/REQUIREMENTS.md` (requirements baseline) and the existing implementation extracted into this directory.
+> Prerequisite: read `docs/REQUIREMENTS.md` (requirements baseline) and the existing implementation extracted into this directory.
 > Status: **Phase A–F completed** (engine package compiles and passes tests). Phase G requires varwof-core integration, executed separately.
 
 ## 0. Current State (Extracted, Compilable, Testable)
@@ -14,12 +14,12 @@ varwof-engine/
   docs/
     REQUIREMENTS.md
     IMPLEMENTATION_PLAN.md
-  go.mod / go.work (mounted)
+  go.mod
 ```
 
 Verification:
 ```bash
-cd engine && go test -count=1 ./...
+go test -count=1 ./...
 ```
 
 ## 1. Implementation Order (Recommended)
@@ -99,8 +99,8 @@ cd engine && go test -count=1 ./...
 
 - [x] `varwof-engine` standalone module build + vet + test all green (including concurrency tests).
 - [x] All FR-1..FR-9 implemented; REQUIREMENTS NFR-1 performance targets met (benchmarks in `engine_bench_test.go`: GetCertStatus ~160–300ns, IssueCert memory ~14µs, ConsumeNonce concurrent CAS).
-- [x] Tests and coverage recorded in `docs/en/TESTING.md` (cache 99.1% / engine 99.0% / db 86.5% with PG real DB / recordbuffer 90.7%); remaining work in `docs/en/NEXT_STEPS.md`.
+- [x] Tests and coverage recorded in `docs/TESTING.md` (cache 99.1% / engine 97.0% / db 83.5% / recordbuffer 81.6%); remaining work in `docs/NEXT_STEPS.md`.
 - [x] `OnCertRevoked` precise invalidation path effective (handshake cache + OCSP LRU) — via `EngineOptions.OnCertRevoked` callback, to be wired after varwof-core integration.
 - [ ] Crash recovery: kill -9 → restart → WAL replay → in-memory index intact (already covered by `recordbuffer` WAL; engine full rebuild covered by `TestEngineRebuildFullState` and `TestConvergenceMemoryAuthoritative`; end-to-end verification pending varwof-core integration environment).
 - [ ] varwof-core gradual migration then full `go test -count=1 -short ./...` green, no manual flush conventions remaining (pending Phase G).
-- [x] Doc-driven: new exported functions have doc comments; `docs/en/api.md` / `docs/en/config.md` / `docs/en/functions.md` kept in sync with implementation.
+- [x] Doc-driven: new exported functions have doc comments; `docs/api.md` / `docs/config.md` / `docs/functions.md` kept in sync with implementation.

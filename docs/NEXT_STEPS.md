@@ -35,19 +35,19 @@ While running `-race` for R6/R9, `recordbuffer` showed a real race: `bufio.Write
 | Phase G: varwof-core gradual migration (`IMPLEMENTATION_PLAN.md` Phase G 1-6) | varwof-core integration | Pending |
 | Crash recovery end-to-end (kill -9 → restart → WAL replay → in-memory index intact) | Requires varwof-core integration environment; engine side covered by `TestEngineRebuildFullState` / `TestConvergenceMemoryAuthoritative` | Pending integration |
 | MySQL/MariaDB real-DB verification | Completed (2026-08-10 + 2026-08-20): local MariaDB 10.11. On 2026-08-20 switched to the 3306 system instance (`varwof` user created) for `-tags mysql`, adding `TestMySQLBulkStoreDANonces` / `TestMySQLBulkRevokeCertificates` (R1/R3 dialect branches on real DB), full suite green | ✅ Done |
-| `go test -race ./...` | Local arm64 kernel ASLR entropy fixed at 39bit (TSan needs ≤32, `vm.mmap_rnd_bits` sysctl refuses downgrade, kernel recompilation needed); concurrency tests designed for CI `-race`. The former pre-existing revocation race is fixed (see "Data race on revocation resolved"); engine suite runs `-race` clean locally | Pending CI |
+| `go test -race ./...` | Concurrency tests run clean under `-race` locally and in CI (`.github/workflows/ci.yml`); earlier revocation race fixed (see "Data race on revocation resolved") | ✅ Done |
 | CI workflow (test + vet + race + coverage gate) | ✅ Done (2026-08-24): `.github/workflows/ci.yml` (build/vet/test/race / coverage gate 85% / real PG & MariaDB service containers) | ✅ Done |
 
 > **PostgreSQL ready** (2026-08-10 + 2026-08-20): local PG 15 online. On 2026-08-20 created `varwof` role (`$PG_PASSWORD`) + `pki` database + `CREATEDB`; `PG_TEST_DSN="postgres://varwof:$PG_PASSWORD@localhost:5432/pki?sslmode=disable"`.
 > PG gated cases: `go test -tags postgres ./db/ -run 'TestPGConnect|TestPGAdvisoryLockReal|TestPGTransferToReal|TestCreatePGDatabaseReal|TestPGBulkStoreDANonces|TestPGBulkRevokeCertificates'`.
-> Covers v1 (consolidated) migration, advisory lock real-DB, `TransferTo` pgx sequence update branch, R1/R3 dialect branches (db coverage 85.6% → 86.5%).
+> Covers v1 (consolidated) migration, advisory lock real-DB, `TransferTo` pgx sequence update branch, R1/R3 dialect branches (db coverage 83.5% → 86.5% with PG real DB).
 
 > **MariaDB ready** (2026-08-10 + 2026-08-20): local 3306 system instance (the 3307 isolated instance from 2026-08-10 is not running).
 > `MYSQL_TEST_DSN="varwof:$MYSQL_PASSWORD@tcp(127.0.0.1:3306)/pki_mysql?charset=utf8mb4&parseTime=true" go test -tags mysql ./db/`.
-> Covers v1 (consolidated) migration, certificate CRUD roundtrip, 999-variable bulk (2000 records), `TransferTo` general path, R1/R3 dialect branches (db coverage 85.6% → 86.1%).
+> Covers v1 (consolidated) migration, certificate CRUD roundtrip, 999-variable bulk (2000 records), `TransferTo` general path, R1/R3 dialect branches (db coverage 83.5% → 86.1% with MySQL real DB).
 > Note: MariaDB `NewDistLock` uses file lock (only PG uses advisory lock).
 
-## Coverage Gaps (engine 99.0% / db 86.5%)
+## Coverage Gaps (engine 97.0% / db 83.5% / cache 99.1% / recordbuffer 81.6%)
 
 | Location | Description | Coverable? |
 |---|---|---|
@@ -65,15 +65,14 @@ While running `-race` for R6/R9, `recordbuffer` showed a real race: `bufio.Write
 - [ ] Deterministic construction test for `RecordBuffer.Add` and `IsFull` race under high concurrency
 - [ ] `TransferTo` target non-empty DB / idempotent re-entry test
 
-## Environment Notes (Local Raspberry Pi 4B)
+## Environment Notes (measured on Intel Core Ultra 5 125H desktop, 2026-08-24)
 
-- TF card slow: `go test -fuzz` must run full package tests before fuzzing; db package ~60-90s previously caused 120s timeout. **Fuzz must add `-run='^$'`**.
-- `go test -race` unavailable (see above).
-- Benchmark figures are hardware-dependent; re-measure on same environment for comparison; README "Benchmarks" table updated periodically (run `go test ./... -bench . -benchmem` directly).
+- `go test -race` runs clean locally (and in CI on GitHub Actions).
+- Benchmark figures are hardware-dependent; re-measure on same environment for comparison; README "Benchmarks" table updated periodically (run `go test ./... -bench . -benchmem` directly). See `docs/BENCHMARK_COMPARISON.md` for a 3-machine comparison (desktop / Raspberry Pi 5 / PN41).
 
 ## Code Review Rules (Write-Path Routing)
 
 - [ ] Hot-path reads must go through engine memory; PRs must not introduce new "read DB as fallback" code (decision in `REQUIREMENTS.md` §7 read/write path routing).
 - [ ] New write methods (IssueCert/Revoke/ConsumeNonce) must not issue synchronous DB calls inside index locks; persistence only via RecordBuffer/WAL asynchronously.
-- [ ] New exported methods must have doc comments (keep `docs/en/functions.md` in sync).
+- [ ] New exported methods must have doc comments (keep `docs/functions.md` in sync).
 - [ ] After dialect/migration changes, regress with `-tags postgres` and `-tags mysql` real-DB suites.

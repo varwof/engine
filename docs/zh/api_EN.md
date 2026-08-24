@@ -14,6 +14,7 @@ func (e *Engine) Stop()           // Drains the write pipeline and stops backgro
 func (e *Engine) FlushAll() error // Synchronous drain (ops/revocation fallback; normally not needed)
 func (e *Engine) Loading() bool   // Whether startup rebuild has completed
 func (e *Engine) DB() *db.DB      // Underlying backend handle
+func (e *Engine) SetDB(d *db.DB)  // Swap the backend handle (e.g. after re-open/migration)
 ```
 
 Usage order: `NewEngine` (performs full rebuild internally) → `Start()` (optional, enables expiry pruning) → business calls → `Stop()`.
@@ -25,10 +26,12 @@ Usage order: `NewEngine` (performs full rebuild internally) → `Start()` (optio
 | `GetCert(caName, serial string) (*db.CertRecord, error)` | Full-field point lookup (includes CertDER) |
 | `GetCertStatus(caName, serial string) (*db.CertStatus, error)` | Lightweight status for OCSP / handshake revocation |
 | `GetCertStatusByIssuer(issuerDN, serial string) (*db.CertStatus, error)` | Point lookup by issuer DN + serial |
-| `GetCertBySPKIHash(spkiHash, caName, status string) ([]*db.CertRecord, error)` | SPKI-associated query, filterable by CA/status |
-| `ListCertsByPrincipalUid(uid, status string) ([]*db.CertRecord, error)` | List by person |
-| `ListCertsByAgentID(agent, status string) ([]*db.CertRecord, error)` | List by agent |
+| `GetCertBySPKIHash(spkiHash, caName, status string, limit int, after *CertCursor) (recs []*db.CertRecord, next *CertCursor, hasMore bool, err error)` | SPKI-associated paged query, filterable by CA/status |
+| `ListCertsByPrincipalUid(uid, status string, limit int, after *CertCursor) (recs []*db.CertRecord, next *CertCursor, hasMore bool, err error)` | Paged list by person |
+| `ListCertsByAgentID(agent, status string, limit int, after *CertCursor) (recs []*db.CertRecord, next *CertCursor, hasMore bool, err error)` | Paged list by agent |
 | `CheckDuplicateCN(caName, cn string, nb, na time.Time) error` | Active-certificate duplicate CN + time-overlap check |
+
+Paged queries (`GetCertBySPKIHash` / `ListCertsByPrincipalUid` / `ListCertsByAgentID`) take a `limit` plus an opaque `*CertCursor`; pass the returned `next` cursor as `after` to fetch the next page (nil starts at the beginning), `hasMore` indicates whether more records exist. Order is (NotBefore desc, serial desc).
 
 Misses return `engine.ErrNotFound`. OCSP semantics (V and expired → Unknown) are applied by callers using `CertStatus.NotAfter`; the engine only guarantees that certificates with `not_after < now - grace` have been evicted from hot memory.
 
@@ -38,6 +41,7 @@ Misses return `engine.ErrNotFound`. OCSP semantics (V and expired → Unknown) a
 |---|---|
 | `IssueCert(rec *db.CertRecord) error` | Writes to memory first (immediately readable), then into the WAL-protected write pipeline. Same (ca,serial) with same fingerprint is idempotent; different fingerprint returns `db.ErrDuplicateSerial`; full pipeline returns `engine.ErrBackpressure` (upper layer should respond 503) |
 | `RevokeCert(caName, serial string, reason int) error` | Atomically sets R in memory → invokes `OnCertRevoked` callback → internally flushes first then queues UPDATE (ordering guaranteed, no manual flush needed upstream) |
+| `RevokeCertsBatch(entries []RevokeBatchEntry) (int, []RevokeBatchEntry, error)` | Batch revocation (single-statement), returns count + failed entries |
 | `RevokeCertsByPrincipalUid(uid string, reason int) (int, error)` | Bulk revocation, returns count |
 | `RevokeCertsBySubCA(caName string, reason int) (int, error)` | Bulk revocation of certificates issued by a sub-CA, returns count |
 
@@ -46,6 +50,7 @@ Misses return `engine.ErrNotFound`. OCSP semantics (V and expired → Unknown) a
 | Method | Description |
 |---|---|
 | `GetRevokedCertEntries(caName string) ([]*db.RevokedCertEntry, error)` | Revoked entries within the validity window, ordered by revoked_at descending (for CRL generation) |
+| `GetRevokedCertEntriesSince(caName string, since time.Time) ([]*db.RevokedCertEntry, error)` | Same as above, filtered to entries revoked at/after `since` (incremental/delta CRL) |
 | `GetRevokedCerts(caName string) ([]*db.CertRecord, error)` | Same as above, returns full records |
 
 ## nonce (One-Time Anti-Replay)
@@ -105,7 +110,7 @@ See the `Metrics` struct for metric items: per-index sizes, `WindowEvictions`, `
 - **Memory is truth**: reads after writes hit memory immediately — no ≤500ms visibility window.
 - **Concurrency safe**: `IssueCert` same-key conflict detection and insertion complete atomically under the index lock (concurrent issuance of same (ca,serial) with different fingerprints: only one succeeds); bulk revocation (`RevokeCertsByPrincipalUid` / `RevokeCertsBySubCA`) state changes also occur under the index lock with no data races against concurrent point queries; revoked sets merge via single-sort (O(n log n)), avoiding O(n²) from per-entry insertion.
 - **Revocation ordering guarantee**: `RevokeCert` internally drains the write pipeline before queuing `UPDATE`, ensuring the backend never sees the race of "revoked but certificate still V". Upper layers no longer need manual `FlushRecordBuffer()`.
-- **Crash recovery**: loss of in-memory indexes → full rebuild at startup; `WalPath` only protects certificate batches not yet persisted in the write pipeline.
+- **Crash recovery**: loss of in-memory indexes → full rebuild at startup; `WalPath` protects certificate batches **and DA nonces** not yet persisted in the write pipeline (R2).
 - **Backend convergence**: idempotent persistence (`INSERT OR IGNORE` / `ON CONFLICT DO NOTHING` / `INSERT IGNORE`).
 
 ## Write Pipeline Concurrency Guarantees

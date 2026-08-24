@@ -14,12 +14,12 @@ varwof-engine/
   docs/
     REQUIREMENTS.md
     IMPLEMENTATION_PLAN.md
-  go.mod / go.work (mounted)
+  go.mod
 ```
 
 Verification command:
 ```bash
-cd engine && go test -count=1 ./...
+go test -count=1 ./...
 ```
 
 ## 1. Implementation Order (recommended)
@@ -98,8 +98,8 @@ cd engine && go test -count=1 ./...
 ## 3. Acceptance Criteria
 
 - [x] `varwof-engine` standalone module build + vet + test all green (including concurrency tests).
-- [x] All FR-1..FR-9 implemented; REQUIREMENTS NFR-1 performance targets met (benchmark comparison, see `engine_bench_test.go` baselines: GetCertStatus ~160–300ns, IssueCert memory ~14µs, ConsumeNonce concurrent CAS).
-- [x] Tests and coverage recorded in `docs/TESTING.md` (cache 99.1% / engine 99.0% / db 86.5% incl. real PG / recordbuffer 90.7%); remaining-work list in `docs/NEXT_STEPS.md`.
+- [x] All FR-1..FR-9 implemented; REQUIREMENTS NFR-1 performance targets met (benchmark comparison, see `engine_bench_test.go` baselines: GetCertStatus ~230ns, IssueCert memory ~7.2µs, ConsumeNonce concurrent CAS).
+- [x] Tests and coverage recorded in `docs/TESTING.md` (cache 99.1% / engine 97.0% / db 83.5% incl. real PG 86.5% / recordbuffer 81.6%); remaining-work list in `docs/NEXT_STEPS.md`.
 - [x] `OnCertRevoked` precise invalidation path works (handshake cache + OCSP LRU) — via the `EngineOptions.OnCertRevoked` callback, hooked up after varwof-core integration.
 - [ ] Crash recovery: kill -9 → restart → WAL replay → intact in-memory indexes (already handled by `recordbuffer` WAL; engine full rebuild covered by `TestEngineRebuildFullState` for revoked/used-nonce/subCA/trust-anchor/AIC paths, `TestConvergenceMemoryAuthoritative` covers memory-authoritative + ordered backend convergence; end-to-end verification awaits the varwof-core integration environment).
 - [ ] After varwof-core gradual migration, full `go test -count=1 -short ./...` green with no residual manual-flush conventions (pending Phase G).
