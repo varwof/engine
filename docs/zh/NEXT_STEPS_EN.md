@@ -36,7 +36,7 @@ Running R6/R9 under `-race` exposed a real `recordbuffer` race: `bufio.Writer` +
 | Crash recovery end-to-end verification (kill -9 → restart → WAL replay → intact memory indexes) | Requires varwof-core integration environment; engine side already covered by `TestEngineRebuildFullState` / `TestConvergenceMemoryAuthoritative` | Awaiting integration environment |
 | MySQL/MariaDB real-database verification | Complete (2026-08-10 + 2026-08-20): local MariaDB 10.11. On 2026-08-20 switched to the 3306 system instance (`varwof` user created) to run `-tags mysql`; added `TestMySQLBulkStoreDANonces` / `TestMySQLBulkRevokeCertificates` (real-DB verification of R1/R3 dialect branches), full suite green | ✅ Done |
 | `go test -race ./...` | Local arm64 kernel ASLR entropy fixed at 39bit (TSan needs ≤32; `vm.mmap_rnd_bits` sysctl refuses lowering; kernel rebuild required); concurrency tests designed so CI can run `-race`. The earlier revocation race has been fixed (see "Revocation Path Data Race Fixed"); engine suite fully green locally under `-race` | Awaiting CI |
-| CI workflow (test + vet + race + coverage gate) | Current directory is not a git repository; **local equivalent ready: `scripts/ci.sh`** (build/vet/test/race auto-skip/coverage gate 85%/optional real PG) | Convert to real CI once repo-hosted |
+| CI workflow (test + vet + race + coverage gate) | ✅ Done (2026-08-24): `.github/workflows/ci.yml` (build/vet/test/race/coverage gate 85%/real PG & MariaDB service containers) | ✅ Done |
 
 > **PostgreSQL ready** (2026-08-10 + 2026-08-20): local PG 15 online. On 2026-08-20 created the `varwof` role (`$PASSWORD`) + `pki` database + `CREATEDB`, `PG_TEST_DSN="postgres://varwof:$PASSWORD@localhost:5432/pki?sslmode=disable"`.
 > PG-gated cases: `go test -tags postgres ./db/ -run 'TestPGConnect|TestPGAdvisoryLockReal|TestPGTransferToReal|TestCreatePGDatabaseReal|TestPGBulkStoreDANonces|TestPGBulkRevokeCertificates'`.
@@ -70,7 +70,7 @@ Running R6/R9 under `-race` exposed a real `recordbuffer` race: `bufio.Writer` +
 
 - TF card is slow: `go test -fuzz` must run the full package tests before fuzzing; the db package takes ~60-90s which once caused a 120s timeout. **Fuzz must add `-run='^$'`**.
 - `go test -race` unavailable (see above).
-- Benchmark numbers are hardware-dependent; re-test within the same environment for comparison; README "Benchmarks" table refreshed periodically (can codify output via `scripts/bench.sh`).
+- Benchmark numbers are hardware-dependent; re-test within the same environment for comparison; README "Benchmarks" table refreshed periodically (run `go test ./... -bench . -benchmem` directly).
 
 ## Code Review Rules (write-path routing)
 

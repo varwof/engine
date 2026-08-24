@@ -36,7 +36,7 @@ While running `-race` for R6/R9, `recordbuffer` showed a real race: `bufio.Write
 | Crash recovery end-to-end (kill -9 → restart → WAL replay → in-memory index intact) | Requires varwof-core integration environment; engine side covered by `TestEngineRebuildFullState` / `TestConvergenceMemoryAuthoritative` | Pending integration |
 | MySQL/MariaDB real-DB verification | Completed (2026-08-10 + 2026-08-20): local MariaDB 10.11. On 2026-08-20 switched to the 3306 system instance (`varwof` user created) for `-tags mysql`, adding `TestMySQLBulkStoreDANonces` / `TestMySQLBulkRevokeCertificates` (R1/R3 dialect branches on real DB), full suite green | ✅ Done |
 | `go test -race ./...` | Local arm64 kernel ASLR entropy fixed at 39bit (TSan needs ≤32, `vm.mmap_rnd_bits` sysctl refuses downgrade, kernel recompilation needed); concurrency tests designed for CI `-race`. The former pre-existing revocation race is fixed (see "Data race on revocation resolved"); engine suite runs `-race` clean locally | Pending CI |
-| CI workflow (test + vet + race + coverage gate) | Current directory is not a git repo; **local equivalent ready: `scripts/ci.sh`** (build/vet/test/race auto-skip / coverage gate 85% / optional PG real-DB) | Ready for repo化 |
+| CI workflow (test + vet + race + coverage gate) | ✅ Done (2026-08-24): `.github/workflows/ci.yml` (build/vet/test/race / coverage gate 85% / real PG & MariaDB service containers) | ✅ Done |
 
 > **PostgreSQL ready** (2026-08-10 + 2026-08-20): local PG 15 online. On 2026-08-20 created `varwof` role (`$PG_PASSWORD`) + `pki` database + `CREATEDB`; `PG_TEST_DSN="postgres://varwof:$PG_PASSWORD@localhost:5432/pki?sslmode=disable"`.
 > PG gated cases: `go test -tags postgres ./db/ -run 'TestPGConnect|TestPGAdvisoryLockReal|TestPGTransferToReal|TestCreatePGDatabaseReal|TestPGBulkStoreDANonces|TestPGBulkRevokeCertificates'`.
@@ -69,7 +69,7 @@ While running `-race` for R6/R9, `recordbuffer` showed a real race: `bufio.Write
 
 - TF card slow: `go test -fuzz` must run full package tests before fuzzing; db package ~60-90s previously caused 120s timeout. **Fuzz must add `-run='^$'`**.
 - `go test -race` unavailable (see above).
-- Benchmark figures are hardware-dependent; re-measure on same environment for comparison; README "Benchmarks" table updated periodically (use `scripts/bench.sh` to freeze output).
+- Benchmark figures are hardware-dependent; re-measure on same environment for comparison; README "Benchmarks" table updated periodically (run `go test ./... -bench . -benchmem` directly).
 
 ## Code Review Rules (Write-Path Routing)
 

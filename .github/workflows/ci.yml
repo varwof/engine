@@ -1,0 +1,135 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test & Coverage Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Gofmt
+        run: test -z "$(gofmt -l .)"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (race)
+        run: go test -race -count=1 ./...
+
+      - name: Coverage gate (>=85%)
+        run: |
+          go test -covermode=atomic -coverprofile=coverage.out -count=1 ./...
+          TOTAL=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | tr -d '%')
+          echo "total coverage: ${TOTAL}%"
+          if awk -v t="$TOTAL" -v g="85.0" 'BEGIN{exit !(t < g)}'; then
+            echo "::error::coverage ${TOTAL}% is below gate 85%"
+            exit 1
+          fi
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  cross-build:
+    name: Cross-platform build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        shell: bash
+        run: go vet ./...
+
+  integration:
+    name: Real DB (${{ matrix.db }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - db: postgresql
+            tags: postgres
+            run: 'TestPGConnect|TestPGAdvisoryLockReal|TestPGTransferToReal'
+          - db: mariadb
+            tags: mysql
+            run: 'TestMySQLConnect|TestMySQLCertRoundtrip|TestMySQLBulkInsert|TestMySQLTransferTo'
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: engine
+          POSTGRES_PASSWORD: engine
+          POSTGRES_DB: engine_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U engine"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: PostgreSQL tests
+        if: matrix.tags == 'postgres'
+        env:
+          PG_TEST_DSN: postgres://engine:engine@127.0.0.1:5432/engine_test?sslmode=disable
+        run: go test -tags postgres -run '${{ matrix.run }}' -v -count=1 ./db/
+
+      - name: MariaDB tests
+        if: matrix.tags == 'mysql'
+        env:
+          MYSQL_TEST_DSN: root:root@tcp(127.0.0.1:3306)/mysql?charset=utf8mb4&parseTime=true
+        run: go test -tags mysql -run '${{ matrix.run }}' -v -count=1 ./db/

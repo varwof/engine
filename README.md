@@ -71,8 +71,8 @@ varwof-engine/
 # Verify the extracted implementation
 cd engine && go test -count=1 ./...
 
-# Local CI (build+vet+test+race+coverage gate, equivalent to CI workflow)
-./scripts/ci.sh
+# CI runs automatically on every push/PR via GitHub Actions
+# (build / vet / race tests / coverage gate >=85% / real PostgreSQL & MariaDB integration)
 
 # Standalone build (no go.work / replace; mount via go.work in varwof-core repo root after integration)
 cd engine && go build ./...
@@ -92,10 +92,10 @@ cd engine && go build ./...
 
 ```bash
 # Full benchmark run (recordbuffer/cache/engine, ~2-3 minutes)
-./scripts/bench.sh
+go test ./recordbuffer/ ./cache/ ./engine/ -bench . -benchmem -benchtime=300ms -run '^$'
 
 # Include db package (slow on TF card)
-./scripts/bench.sh all
+go test ./db/ -bench . -benchmem -benchtime=300ms -run '^$'
 
 # Single benchmark (-benchmem outputs bytes/allocs per op)
 go test ./engine/ -bench '^BenchmarkGetCertStatus$' -benchmem -run '^$'

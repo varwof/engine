@@ -71,8 +71,8 @@ varwof-engine/
 # 验证提取的现状实现
 cd engine && go test -count=1 ./...
 
-# 本地 CI（build+vet+test+race+覆盖率门禁，等价于 CI 工作流）
-./scripts/ci.sh
+# CI 由 GitHub Actions 在每次 push/PR 自动执行
+# （build / vet / race 测试 / 覆盖率门禁 >=85% / PostgreSQL 与 MariaDB 真库集成）
 
 # 本模块独立构建（无 go.work / replace，varwof-core 接入后在其仓库根建 go.work 挂载）
 cd engine && go build ./...
@@ -92,10 +92,10 @@ cd engine && go build ./...
 
 ```bash
 # 单次全量基准（recordbuffer/cache/engine，~2-3 分钟）
-./scripts/bench.sh
+go test ./recordbuffer/ ./cache/ ./engine/ -bench . -benchmem -benchtime=300ms -run '^$'
 
 # 加 db 包（TF 卡上很慢）
-./scripts/bench.sh all
+go test ./db/ -bench . -benchmem -benchtime=300ms -run '^$'
 
 # 单个基准（-benchmem 输出每次分配的字节/对象数）
 go test ./engine/ -bench '^BenchmarkGetCertStatus$' -benchmem -run '^$'

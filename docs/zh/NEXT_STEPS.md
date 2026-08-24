@@ -36,7 +36,7 @@ R6/R9 跑 `-race` 时暴露 `recordbuffer` 真实竞态：`bufio.Writer` + WAL `
 | 崩溃恢复端到端验证（kill -9 → 重启 → WAL 回放 → 内存索引完整） | 需 varwof-core 集成环境；engine 侧已由 `TestEngineRebuildFullState` / `TestConvergenceMemoryAuthoritative` 覆盖 | 待集成环境 |
 | MySQL/MariaDB 真库验证 | 已完成（2026-08-10 + 2026-08-20）：本机 MariaDB 10.11。2026-08-20 改用 3306 系统实例（`varwof` 用户已建）跑 `-tags mysql`，新增 `TestMySQLBulkStoreDANonces` / `TestMySQLBulkRevokeCertificates`（R1/R3 方言分支真库验证），全套件全绿 | ✅ 已完成 |
 | `go test -race ./...` | 本机 arm64 内核 ASLR 熵固定 39bit（TSan 需 ≤32，`vm.mmap_rnd_bits` sysctl 拒绝下调，需重编内核）；并发测试已设计为 CI 可跑 `-race`。此前的吊销竞态已修复（见「吊销路径数据竞态已修复」）；engine 套件本机 `-race` 全绿 | 待 CI |
-| CI workflow（test + vet + race + 覆盖率门禁） | 当前目录非 git 仓库；**本地等价物已就绪：`scripts/ci.sh`**（build/vet/test/race 自动跳过/覆盖率门禁 85%/可选 PG 真库） | 仓库化后转真 CI |
+| CI workflow（test + vet + race + 覆盖率门禁） | ✅ 已完成（2026-08-24）：`.github/workflows/ci.yml`（build/vet/test/race/覆盖率门禁 85%/PG 与 MariaDB 真库服务容器） | ✅ 已完成 |
 
 > **PostgreSQL 已就绪**（2026-08-10 + 2026-08-20）：本机 PG 15 在线。2026-08-20 创建 `varwof` 角色（`$PASSWORD`）+ `pki` 数据库 + `CREATEDB`，`PG_TEST_DSN="postgres://varwof:$PASSWORD@localhost:5432/pki?sslmode=disable"`。
 > PG 门控用例：`go test -tags postgres ./db/ -run 'TestPGConnect|TestPGAdvisoryLockReal|TestPGTransferToReal|TestCreatePGDatabaseReal|TestPGBulkStoreDANonces|TestPGBulkRevokeCertificates'`。
@@ -70,7 +70,7 @@ R6/R9 跑 `-race` 时暴露 `recordbuffer` 真实竞态：`bufio.Writer` + WAL `
 
 - TF 卡慢：`go test -fuzz` 必须先跑完整包测试再 fuzz，db 包 ~60-90s 曾致 120s 超时。**fuzz 必须加 `-run='^$'`**。
 - `go test -race` 不可用（见上）。
-- 基准数字为硬件相关，重测需在同一环境下对比；README「基准」表定期重测更新（可用 `scripts/bench.sh` 固化输出）。
+- 基准数字为硬件相关，重测需在同一环境下对比；README「基准」表定期重测更新（`go test ./... -bench . -benchmem` 直接运行）。
 
 ## 代码审查规则（写路径路由）
 
