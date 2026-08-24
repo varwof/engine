@@ -10,6 +10,7 @@ Measured 2026-08-24, `-benchtime=300ms`, single run per package.
 | Architecture | x86_64 | aarch64 | x86_64 |
 | RAM | — | 4 GB | 8 GB |
 | OS | Linux 6.17.0-35-generic | Raspberry Pi OS bookworm, kernel 6.12.87+rpt-rpi-2712 | Debian 13, kernel 6.12.90+deb13.1-amd64 |
+| Storage | SSD (SK Hynix) | microSD, Lexar 633x | SSD, Lexar N610 512 GB |
 | Go | 1.26.7 | 1.26.2 | 1.26.2 |
 
 ## Results
@@ -42,6 +43,7 @@ Ratio < 1 means the machine is faster than the desktop.
   slower than the desktop, in line with its modest single-thread throughput.
 - Desktop wins on the disk-backed fsync path (`RecordBufferAddWAL`), but the
   PN41 (SATA/NVMe) beats the Pi 5 (SD card) on the same benchmark
-  (12.5 µs vs 44.5 µs).
+  (12.5 µs vs 44.5 µs), consistent with their storage: Hynix SSD ≫
+  Lexar N610 SSD > Lexar 633x microSD.
 - `PutAll` vs `Put` batch gain holds on all three machines
   (Pi 5 n=1000: 0.26ms vs 0.54ms ~2.1×; PN41 n=1000: 0.71ms vs 1.93ms ~2.7×).
