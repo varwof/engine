@@ -2,6 +2,8 @@
 
 > In-memory-centric high-performance data subsystem for varwof-core: OCSP / CRL / nonce / certificate status with resident-memory queries and batch persistence.
 
+> ⚠️ **Preview** — Not for production use. APIs and features may change before official release.
+
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Go Reference](https://pkg.go.dev/badge/github.com/varwof/engine)](https://pkg.go.dev/github.com/varwof/engine)
 
