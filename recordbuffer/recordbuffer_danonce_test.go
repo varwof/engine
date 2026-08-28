@@ -22,9 +22,71 @@ func daNonce(t *testing.T, seed byte) []byte {
 	return n
 }
 
+// TestRecordBufferAddDANonceNoWALBatches verifies the WAL-less batch path for
+// DA nonces: AddDANonce accepts nonces without WAL, converges them to the DB in
+// a bulk statement after a flush (batched, not one INSERT per nonce), and
+// reports them via pending. This is the throughput fix for AIC issuance on
+// non-file backends (PostgreSQL/MySQL), which previously hit a synchronous
+// single-row INSERT per request.
+func TestRecordBufferAddDANonceNoWALBatches(t *testing.T) {
+	dir := t.TempDir()
+	d, err := db.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	rb, err := NewRecordBuffer(func() *db.DB { return d }, 1<<30, 100000, time.Hour, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rb.Stop()
+
+	if rb.WALEnabled() {
+		t.Fatal("WAL should be disabled with empty walPath")
+	}
+
+	const n = 100
+	nonces := make([][]byte, n)
+	for i := range nonces {
+		nonces[i] = daNonce(t, byte(i))
+		if err := rb.AddDANonce(nonces[i]); err != nil {
+			t.Fatalf("AddDANonce %d: %v", i, err)
+		}
+	}
+	if rb.Pending() != n {
+		t.Fatalf("pending = %d, want %d", rb.Pending(), n)
+	}
+
+	// AddDANonce signals the drain loop; the batch converges to the DB
+	// promptly via BulkStoreDANonces. Poll until all nonces are visible.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		all := true
+		for i := range nonces {
+			if used, _ := d.IsDANonceUsed(nonces[i]); !used {
+				all = false
+				break
+			}
+		}
+		if all {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("nonces did not converge to DB within 3s")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	rb.FlushAll()
+	if rb.Pending() != 0 {
+		t.Fatalf("pending after FlushAll = %d, want 0", rb.Pending())
+	}
+}
+
 // TestRecordBufferAddDANonceSyncNoWAL verifies the WAL-disabled path returns
-// ErrWALDisabled so the engine falls back to synchronous DB persistence (the
-// crash-safety contract for DA nonces without a WAL).
+// ErrWALDisabled so AddDANonceSync (the durable, WAL-fsynced variant) is never
+// used without a WAL; WAL-less engines use the batch AddDANonce path instead.
 func TestRecordBufferAddDANonceSyncNoWAL(t *testing.T) {
 	rb, err := NewRecordBuffer(func() *db.DB { return nil }, 100, 1000, time.Hour, "")
 	if err != nil {

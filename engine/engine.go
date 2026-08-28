@@ -38,6 +38,8 @@ type Metrics struct {
 	SubCASize       int
 	TrustAnchorSize int
 	AICSize         int
+	UserIndexSize   int
+	TokenIndexSize  int
 
 	CertResidentBytes int64
 	AICResidentBytes  int64
@@ -69,6 +71,8 @@ type Engine struct {
 	subCas    *SubCAIndex
 	trust     *TrustIndex
 	aic       *AICIndex
+	users     *userIndex
+	tokens    *tokenIndex
 	rb        *recordbuffer.RecordBuffer
 	loaded    atomic.Bool
 	started   atomic.Bool
@@ -114,6 +118,8 @@ func NewEngine(d *db.DB, opts EngineOptions) (*Engine, error) {
 		subCas:       NewSubCAIndex(),
 		trust:        NewTrustIndex(),
 		aic:          NewAICIndex(),
+		users:        newUserIndex(),
+		tokens:       newTokenIndex(),
 		writerShards: shards,
 		ctx:          ctx,
 		cancel:       cancel,
@@ -147,6 +153,11 @@ func NewEngine(d *db.DB, opts EngineOptions) (*Engine, error) {
 
 // DB returns the backend database handle.
 func (e *Engine) DB() *db.DB { return e.db.Load() }
+
+// NonceTTL returns the configured unused-nonce lifetime. It is the last-resort
+// retention fallback for DA nonces when neither the timestamp-skew window nor
+// the DA lifetime is available.
+func (e *Engine) NonceTTL() time.Duration { return e.opts.NonceTTL }
 
 // SetDB atomically swaps the backend database handle. It is used on config
 // reload when the database connection changes but the engine's in-memory
@@ -272,6 +283,8 @@ func (e *Engine) Metrics() Metrics {
 		SubCASize:         e.subCas.Len(),
 		TrustAnchorSize:   e.trust.Len(),
 		AICSize:           e.aic.Len(),
+		UserIndexSize:     e.users.len(),
+		TokenIndexSize:    e.tokens.len(),
 		CertResidentBytes: e.certIdx.ResidentBytes(),
 		AICResidentBytes:  e.aic.ResidentBytes(),
 		WindowEvictions:   e.evictions.Load(),

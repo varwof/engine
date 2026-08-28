@@ -77,6 +77,9 @@
 | Function | File |
 |---|---|
 | `(*DB) BulkStoreDANonces(nonces [][]byte) (int, error)` | da_nonces.go — multi-row INSERT, duplicates ignored, 32-byte enforced |
+| `(*DB) BulkStoreDANoncesCtx(ctx context.Context, nonces [][]byte) (int, error)` | da_nonces.go — context-aware variant (used by the recordbuffer batch flush, wrapped in `flushDBTimeout`); legacy entry delegates to `context.Background()` |
+| `(*DB) BulkInsertCertRecords(records []*CertRecord) (int, error)` / `BulkInsertCertRecordsCtx(ctx, records) (int, error)` | batch.go — multi-row INSERT (chunked by `certChunkSize` rows). PG/MySQL chunk = 500 rows/statement (~13× fewer round-trips), SQLite = 39 rows (999-variable bound) |
+| `(*DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)` | db.go — context-aware rebind+adapt batch Exec (backend of the chunk-level Ctx variants) |
 | `(*DB) BulkRevokeCertificates(entries []RevokeBatchEntry) (int, error)` | bulk_revoke.go — one CASE UPDATE per ~199-entry chunk, per-row reasons |
 
 ## Sub-CA / Trust Anchor / AIC

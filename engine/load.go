@@ -64,6 +64,22 @@ func (e *Engine) load() error {
 		e.trust.put(a)
 	}
 
+	users, err := e.DB().ListRBACUsers()
+	if err != nil {
+		return err
+	}
+	for i := range users {
+		e.users.put(&users[i])
+	}
+
+	tokens, err := e.DB().ListAllTokenHashes()
+	if err != nil {
+		return err
+	}
+	for i := range tokens {
+		e.tokens.put(tokens[i])
+	}
+
 	offset = 0
 	for {
 		aics, err := e.DB().ListAICExtensions("", loadPageSize, offset)

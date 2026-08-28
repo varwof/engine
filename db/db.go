@@ -4,6 +4,7 @@
 package db
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rsa"
@@ -154,6 +155,13 @@ func OpenWithDialect(dsn string, d Dialect) (*DB, error) {
 	var err error
 	if driverName == "sqlite" {
 		db, err = sql.Open(driverName, dsn+d.OpenSuffix())
+	} else if driverName == "mysql" {
+		// A MySQL server can close/drop a connection mid-statement (packet limits,
+		// overload, network blip). go-sql-driver blocks forever waiting for a reply
+		// when no read/write deadline is configured — a half-open socket then hangs
+		// the write pipeline flush indefinitely. Enforce sane driver-level timeouts
+		// unless the caller already set them: dial 10s, per-read 30s, per-write 30s.
+		db, err = sql.Open(driverName, ensureMySQLTimeouts(d.DSN()))
 	} else {
 		db, err = sql.Open(driverName, d.DSN())
 	}
@@ -191,6 +199,44 @@ func OpenWithDialect(dsn string, d Dialect) (*DB, error) {
 		slog.Warn("db: v12 backfill incomplete", "error", err)
 	}
 	return result, nil
+}
+
+// ensureMySQLTimeouts injects go-sql-driver/mysql network timeouts into a DSN
+// that does not already set them. Without read/write deadlines the driver has
+// no way to notice a half-open connection: the write pipeline's bulk Exec would
+// block forever in readPacket (observed: MySQL+engine high-rate issuance wedges
+// with the drain goroutine holding flushMu, pending pinned at maxPending → the
+// whole write pipeline stalls and graceful shutdown deadlocks on FlushAll).
+func ensureMySQLTimeouts(dsn string) string {
+	if dsn == "" || strings.Contains(dsn, "@unix(") {
+		return dsn
+	}
+	// Guard against substring matches inside existing values (e.g. a password or
+	// charset name): require a param-boundary occurrence for each key.
+	has := func(k string) bool {
+		for _, part := range strings.Split(dsn, "&") {
+			part = strings.TrimPrefix(part, "?")
+			if strings.HasPrefix(part, k+"=") {
+				return true
+			}
+		}
+		return false
+	}
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	var suffix strings.Builder
+	for _, kv := range [][2]string{{"timeout", "10s"}, {"readTimeout", "30s"}, {"writeTimeout", "30s"}} {
+		if !has(kv[0]) {
+			suffix.WriteString(sep)
+			suffix.WriteString(kv[0])
+			suffix.WriteByte('=')
+			suffix.WriteString(kv[1])
+			sep = "&"
+		}
+	}
+	return dsn + suffix.String()
 }
 
 // backfillV12 parses existing certificates and trust_anchors DER and populates
@@ -369,6 +415,18 @@ func (d *DB) Exec(query string, args ...interface{}) (sql.Result, error) {
 		query = adaptInsertSQL(query, d.dialect)
 	}
 	return d.DB.Exec(d.Rebind(query), args...)
+}
+
+// ExecContext is the context-aware variant of Exec. The write pipeline uses it
+// with a bounded deadline so a hung backend connection (e.g. a half-open MySQL
+// socket with no read timeout) cannot block a flush indefinitely: database/sql
+// cancels the driver call on ctx expiry, surfacing either the driver error or
+// context.DeadlineExceeded so the pipeline can retry instead of wedging.
+func (d *DB) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	if d.dialect.DriverName() == "pgx" || d.dialect.DriverName() == "mysql" {
+		query = adaptInsertSQL(query, d.dialect)
+	}
+	return d.DB.ExecContext(ctx, d.Rebind(query), args...)
 }
 
 // Query overrides sql.DB.Query with auto-rebind.

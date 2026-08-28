@@ -30,6 +30,8 @@
 
 **状态：✅ 已修复（2026-08-20）** — `RecordBuffer.AddDANonceSync` 返回前同步 fsync WAL；无 WAL 时 `StoreDANonce` 回退同步 DB 持久化。签发确认前 nonce 已持久化，重启恢复从 WAL 回放进 `da_nonces` 表 + 内存。测试：`TestStoreDANonceWALCrashRecovery`（kill -9 子进程）、`TestStoreDANonceNoWALFallbackSync`、`TestRecordBufferDANonceWALReplay`。
 
+**更新（2026-08-27）** — 无 WAL（非文件后端：PostgreSQL/MySQL）时 `StoreDANonce` 改为把 nonce 缓冲进批量写管道（`RecordBuffer.AddDANonce` → `BulkStoreDANonces`），不再每请求同步单行 INSERT。旧路径是 AIC 每请求吞吐墙（~3,200 certs/s 上限，每个 nonce 都同步过 WAL fsync）。内存对重放校验即刻权威；后台 `da_nonces` 表在下次批量 flush 收敛。无 WAL 后端的未 flush 崩溃窗口改为**接受的取舍**（见 `StoreDANonce` 与 `AddDANonce` 注释）——flush 前崩溃可能丢失未落库 nonce，导致回放签名暂时可被接受直至 DB 收敛；WAL 后端仍保持完整崩溃安全。测试：`TestStoreDANonceNoWALBatchAndReplay`、`TestDANonceNoWALBatchConvergence`、`TestRecordBufferAddDANonceNoWALBatches`。
+
 ## 🔴 R3 — 批量吊销为 N 条串行 UPDATE
 
 **位置：** `engine/writes.go` `RevokeCertsBatch` / `RevokeCertsByPrincipalUid` / `RevokeCertsBySubCA`
@@ -120,6 +122,84 @@
 4. ~~R6 + R9 — 查询分页 + AIC janitor 清理~~ ✅（2026-08-20）
 5. ~~R8 + R10 — 内存预算 + 指标~~ ✅（2026-08-20）
 
+## 🟡 R11 — RBAC 用户/Token 内存索引的一致性夹角（2026-08-27）
+
+认证读路径（authByToken / authByBasic / authFromAIC / gateway 委托）与用户/
+Token 管理写路径全部经 serve 包装方法（engine 优先、DB 回退；写穿先落 DB 再
+刷新驻留行）。**剩余两个可接受的夹角**:
+
+1. **OOB 新增不可见性**：CLI/第二实例绕过 serve 直接写库创建的用户/Token，
+   engine 内存不知情 → 该账户认证回退 DB（可读，不丢功能），但**不享受内存
+   快路径**，直至重启全量载入。
+2. **OOB 删除残留（与证书相反方向）**：DB 里已删的用户/Token 若仍驻留内存，
+   内存会继续认证它（内存即真相）——与证书 OOB 写"读回退 DB 可见"方向相反。
+   缓解：serve 内删/改/密码轮换全部走写穿，内存与后端同步，这是唯一受支持的
+   运维通道；纯 DB 外删需重启或以写穿通道执行。TPM 侧相同。
+
+修复顺序（2026-08-27）：`R11` 无修复项 —— 为**接受的权衡**，方向与 `R2` 无
+WAL 取舍一致（内存即真相 + OOB 退化为 DB 往返/重启收敛），已在
+`docs/REQUIREMENTS.md` 与 serve 侧包装方法注释中记录。
+
+## 🔴 R12 — 写管线在后端半开连接下永久阻塞（2026-08-27）
+
+**位置：** `db/batch.go` / `db/da_nonces.go` / `recordbuffer/record_buffer.go`
+
+MySQL 连接半开（对端挂死/重置）时，`bulkInsertChunk→Exec` 内层
+`mysqlConn.readPacket` **无读超时地永久阻塞**，而 flush 全程持有 `flushMu`：
+drain goroutine 卡死 → pending 钉在 maxPending（全请求 503）→
+`Stop()→FlushAll()` 死锁等同一把锁 → 优雅停机挂死。此前文档记录
+"MySQL+engine 写管线瘫：内存涨 21GB + connection reset by peer" 即此故障族
+（其中 21GB 一项经 dmesg 实证为 OOM 击杀：`oom-kill bench-smoke anon-rss
+~21GB`，现版本已有 2GiB `MaxResidentBytes` 预算兜底，不再复现）。
+
+**修复：**
+1. `db/db.go`：`OpenWithDialect` 的 mysql 分支注入 `ensureMySQLTimeouts`（缺省补
+   `timeout=10s&readTimeout=30s&writeTimeout=30s`，已存在不覆盖，`@unix(` 跳过）；
+   新增 `ExecContext`（ctx 感知的 rebind+adapt 批量 Exec）。
+2. `db/batch.go` / `db/da_nonces.go`：新增 `BulkInsertCertRecordsCtx` /
+   `BulkStoreDANoncesCtx` 及分块 ctx 变体，旧入口委托 `context.Background()`。
+3. `recordbuffer/record_buffer.go`：`flushLocked` / `replayWAL` 的批量写统一包
+   `context.WithTimeout(..., flushDBTimeout=2min)` —— 半开连接至多拖 2 分钟即
+   返回错误走重试，不再无限阻塞。
+
+**状态：✅ 已修复（2026-08-27）** — 顺带把 PG/MySQL 批量分块从 39 行/条提升到
+500 行/条（`certChunkSize`，SQLite 仍守 999 变量上限）：写入往返次数降 ~13×，
+MySQL AIC @100ms 从 4,325 → **6,034 certs/s**。真库验证：MySQL regular @100ms
+（原崩溃场景）7,575 certs/s、AIC @100ms 6,034 certs/s、AIC @600ms 4,114/s，
+全部 exit=0 且正常打印报告；PG AIC @600ms 4,054/s 无回归。`-race` 全绿。
+新单测：`TestEnsureMySQLTimeouts`、`TestBulkInsertCertRecordsCtxCancelled`、
+`TestBulkStoreDANoncesCtxCancelled`。
+
 各项修复状态在 `docs/NEXT_STEPS.md` 和 `docs/zh/NEXT_STEPS.md` 中跟踪。
 
 > **真库验证已完成（2026-08-20）**：`BulkStoreDANonces` / `BulkRevokeCertificates` 方言分支已在本机 PostgreSQL 15 与 MariaDB 10.11 上验证——新增 `TestPGBulkStoreDANonces` / `TestPGBulkRevokeCertificates` / `TestMySQLBulkStoreDANonces` / `TestMySQLBulkRevokeCertificates`（每次运行新建独立数据库，批量存储 + 重复忽略/幂等重跑 + 32 字节校验 + 跨分块每行 reason）。`go test -tags postgres` / `-tags mysql ./...` 全套件全绿。
+## 🔴 R13 — 满缓冲 DA nonce 存储打雷群涌入 flushMu（2026-08-27）
+
+**位置:** `recordbuffer/record_buffer.go`（`AddDANonce` / `AddDANonceSync`）
+
+当 record buffer 达到 `maxPending` 时，`AddDANonce` 会在每个请求上执行同步
+`FlushAll()`。`FlushAll` 在整个 flush pass 期间持有 `flushMu`（一次性批量插入
+**全部** pending 记录，O(积压量)），因此一旦缓冲填满——持续 AIC 负载在默认 20k
+pending 下约 18s 填满——每个请求 goroutine 都串行排在同一个 `flushMu` 后面：
+整个服务器冻结，pending 钉在 maxPending。在 engine bench 下表现为硬吞吐塌缩：
+40s AIC @100ms 运行在 ~108k 成功（与 20s 运行相同）处停滞，p99 涨到 ~22s，
+约 2,000 个 goroutine 阻塞在 `FlushAll`，而 drain goroutine 仍在批量冲洗 8.5 万条
+记录。
+
+**修复:** 同步追加路径不再自行 flush。满时 `waitForCapacity()` 唤醒 drain 循环并
+在 close-and-replace 广播通道（`capacitySignal`，drain 每次 flush pass 触发）上
+睡眠；容量一释放全部 waiter 同时唤醒。若 drain 在 `fullWaitTimeout`（5s）内无法
+腾出容量，`AddDANonce` 返回新的 `recordbuffer.ErrBackpressure`，
+`Engine.StoreDANonce` 归一化为 `engine.ErrBackpressure`，serve 调用方返回 503
+（签发失败、不产生证书、重放防护永不削弱）。这是真正的背压——缓冲满意味着后端
+无法吸收写入——优雅降级而非全服务器死锁。
+
+**状态: ✅ 已修复（2026-08-27）** — 40s AIC @100ms（MySQL、engine、2500 agents）
+从 ~108k 平台恢复到 **~163k 成功（~4.1k certs/s）**，恰好等于 MySQL 批量插入
+持续上限（含 DA nonce 约 8k records/s；独立测量：500 行 chunk ≈ 7.3k certs/s）；
+不再有 goroutine 阻塞在 `FlushAll`；背压以干净的 503 呈现。20s 运行可突发到
+~5.3k certs/s（缓冲吸收），随后稳定到 ~4k/s 持续。新增单测：
+`TestRecordBufferAddDANonceWaitsForCapacity`、
+`TestRecordBufferAddDANonceConcurrentWaits`、
+`TestRecordBufferAddDANonceBackpressureTimeout`。`recordbuffer/`/`engine/`/`db/`
+`-race` 全绿。

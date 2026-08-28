@@ -33,8 +33,10 @@ varwof-core 当前的数据层存在以下结构性矛盾（已在生产高并�
 | 子 CA | `sub_cas` | 子 CA 状态/协议点查、CA 关系遍历 |
 | 信任锚 | `trust_anchors` | 信任链校验热数据 |
 | AIC 扩展 | `aic_extensions` | AIC 按 (ca,serial)/principal/agent 查询 |
+| 用户 | `rbac_users` | **认证热数据（2026-08-27 新增）**：全行驻留（username→凭据/角色/CA 作用域/enabled + id 索引），凭据校验、role/cascope 解析、token JOIN 不落 SQL |
+| API Token | `rbac_api_tokens` | **认证热数据（2026-08-27 新增）**：仅驻留 SHA-256 hash（永不含明文），读时校验 expiry + 用户 enabled（语义等同 `db.GetToken` 的 JOIN+WHERE） |
 
-> rbac_users / rbac_api_tokens / audit_log / audit_salts / acme_* / ra_* / webhook_subscriptions / key_escrow / ct_logs / gateway_registry / scep_requests / cross_certs / ca_meta 等**低频表保持纯 SQL**（经底层 `db` 包透传），不进内存存储。
+> audit_log / audit_salts / acme_* / ra_* / webhook_subscriptions / key_escrow / ct_logs / gateway_registry / scep_requests / cross_certs / ca_meta 等**低频表保持纯 SQL**（经底层 `db` 包透传），不进内存存储。**rbac_users / rbac_api_tokens 自 2026-08-27 起为认证热数据**：engine 启动全量载入 + 内存即真相读取（serve 读路径 engine 优先、DB 回退），写路径经 serve 写穿（先落 DB 再刷新驻留行）。
 
 ### 2.2 后端持久化（写穿目标）
 
@@ -110,7 +112,7 @@ varwof-core 当前的数据层存在以下结构性矛盾（已在生产高并�
 - 并发安全：Consume 必须是「未用 → 已用」的原子 CAS 语义（并发 double-spend 只有一个成功）。
 - 后台 TTL 清理（对应 `CleanupExpiredNonces`），批量删除后端 `renewal_tokens`。
 - 注意 MySQL `VARBINARY(16)` / PG `BYTEA` / SQLite `BLOB` 的 nonce 主键方言差异由底层 db 包处理。
-- **DA nonce（32B，`da_nonces`）** 防重放要求**确认前先持久化**：启用 WAL 时 nonce 同步 WAL fsync（`AddDANonceSync`）并批量收敛后端（`BulkStoreDANonces`）；无 WAL 时同步落库。见 `docs/RISKS.md` R1/R2。
+- **DA nonce（32B，`da_nonces`）** 防重放要求**确认前先持久化**：启用 WAL 时 nonce 同步 WAL fsync（`AddDANonceSync`）并批量收敛后端（`BulkStoreDANonces`）；无 WAL 时缓冲进批量写管道（`AddDANonce`）并在下次批量 flush 收敛（内存对重放校验即刻权威；无 WAL 后端未落库 nonce 按设计不可崩溃安全）。见 `docs/RISKS.md` R1/R2。
 
 **FR-5 子 CA / 信任锚 / AIC**
 - `SubCAIndex`：`(name)` → SubCA 记录 + `parent_ca` 反向索引。

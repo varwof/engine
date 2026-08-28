@@ -66,6 +66,7 @@
 | Function | File |
 |---|---|
 | `(*RecordBuffer) Add(rec *db.CertRecord) bool` | record_buffer.go |
+| `(*RecordBuffer) AddDANonce(nonce []byte) error` | record_buffer.go — WAL-less batch path: buffers a DA nonce into the write pipeline (converges via `BulkStoreDANonces`); never rejects (force-flushes if full) |
 | `(*RecordBuffer) AddDANonceSync(nonce []byte) error` | record_buffer.go — synchronously fsyncs the WAL before returning (DA nonce crash safety); returns `ErrWALDisabled` without WAL |
 | `(*RecordBuffer) WALEnabled() bool` | record_buffer.go |
 | `(*RecordBuffer) Pending() int32` / `IsFull() bool` / `FlushAll()` / `Stop()` | record_buffer.go |
@@ -78,7 +79,36 @@
 | Function | File |
 |---|---|
 | `(*DB) BulkStoreDANonces(nonces [][]byte) (int, error)` | da_nonces.go — multi-row INSERT, duplicates ignored, enforces 32 bytes |
+| `(*DB) BulkStoreDANoncesCtx(ctx context.Context, nonces [][]byte) (int, error)` | da_nonces.go — context-aware variant (used by the recordbuffer batch flush, wrapped in `flushDBTimeout`); legacy entry delegates to `context.Background()` |
+| `(*DB) BulkInsertCertRecords(records []*CertRecord) (int, error)` / `BulkInsertCertRecordsCtx(ctx, records) (int, error)` | batch.go — multi-row INSERT (chunked by `certChunkSize` rows). PG/MySQL chunk = 500 rows/statement (~13× fewer round-trips), SQLite = 39 rows (999-variable bound) |
+| `(*DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)` | db.go — context-aware rebind+adapt batch Exec (backend of the chunk-level Ctx variants) |
 | `(*DB) BulkRevokeCertificates(entries []RevokeBatchEntry) (int, error)` | bulk_revoke.go — chunked CASE UPDATE (~199 rows per statement), carries per-row reason |
+
+## RBAC users / API tokens (new 2026-08-27, in-memory authentication)
+
+Memory-is-truth extension: on startup the engine fully loads rbac_users (full
+rows) and rbac_api_tokens (SHA-256 hashes only, never raw token material); the
+server's authentication read paths (authByToken / authByBasic / authFromAIC /
+gateway delegation) read engine-first, DB-fallback.
+
+| Function | File |
+|---|---|
+| `(*Engine) GetUserByUsername(username string) (*db.RBACUser, error)` | user_token.go — miss → `ErrNotFound` |
+| `(*Engine) GetUserByID(id int) (*db.RBACUser, error)` | user_token.go — write path refreshes the resident row by id |
+| `(*Engine) GetToken(token string) (*db.TokenInfo, error)` | user_token.go — in memory enforces expiry + owning user enabled (mirrors `db.GetToken`'s JOIN+WHERE) |
+| `(*Engine) PutUser(u *db.RBACUser)` | user_token.go — write-through entry (create/update user) |
+| `(*Engine) DeleteUserByID(id int)` | user_token.go |
+| `(*Engine) PutTokenHash(r db.TokenHashRow)` | user_token.go — write-through entry (login / token mint) |
+| `(*Engine) DeleteTokenByHash(hash string)` | user_token.go |
+| `(*Engine) DeleteTokenByID(id int)` | user_token.go |
+| `(*Engine) DeleteTokensByUserID(userID int)` | user_token.go — clears an account's tokens on password rotation / user delete |
+| `(*DB) ListRBACUsers() ([]RBACUser, error)` | db/rbac.go — startup load source (credential columns included) |
+| `(*DB) ListAllTokenHashes() ([]TokenHashRow, error)` | db/rbac.go — startup load source (hash+owner+expiry) |
+
+Write-path contract: the server persists to the backend first (it owns identity
+generation and write serialization), then refreshes/removes the resident row so
+memory and backend stay in step. Out-of-band (CLI / second instance) users are
+not resident → authentication falls back to the DB (same as cert OOB behavior).
 
 ## Sub-CA / Trust Anchor / AIC
 
@@ -111,6 +141,7 @@
   - `NewRevokedSet(maxPerCA int)` (engine/revoked_set.go) — when `maxPerCA > 0`, per-CA over-limit evicts the oldest revocation (status remains R; only leaves the CRL window)
   - `NewNonceSet(max int)` (engine/nonce_set.go) — 16B RenewalToken nonces; DA nonces (32B) reuse the same type with exists-equals-used semantics (`has()` query), see `StoreDANonce` in `engine/writes.go`
   - `NewSubCAIndex()` / `NewTrustIndex()` / `NewAICIndex()` (engine/meta_index.go) — `AICIndex.ResidentBytes()` (R8)
+  - private `userIndex` / `tokenIndex` (engine/user_token.go) — user/Token memory indexes; `Metrics` gained `UserIndexSize` / `TokenIndexSize`
 
 ## Metrics (Prometheus)
 

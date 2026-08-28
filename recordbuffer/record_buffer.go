@@ -31,6 +31,15 @@ const (
 	// unboundedly. This interval forces a periodic convergence to avoid the lock
 	// overhead of checkpointing on every flush.
 	checkpointInterval = 2 * time.Second
+	// flushDBTimeout bounds each backend bulk write issued by the flush and WAL
+	// replay paths. A MySQL connection that goes half-open mid-INSERT has no
+	// intrinsic read deadline (see db.ensureMySQLTimeouts for the driver-level
+	// backstop) — without this context the drain goroutine would block forever in
+	// readPacket while holding flushMu, wedging the whole write pipeline (pending
+	// pinned at maxPending → every issuance returns 503) and deadlocking Stop().
+	// 2 minutes is generous for real 200K-record flush passes (thousands of
+	// 39-row chunk statements) yet still bounds a genuine hang.
+	flushDBTimeout = 2 * time.Minute
 )
 
 // ItemKind discriminates the record kinds a RecordBuffer can carry.
@@ -100,6 +109,36 @@ type RecordBuffer struct {
 	cancel context.CancelFunc
 	db     func() *db.DB
 	wg     sync.WaitGroup
+
+	// capacity signals waiters in waitForCapacity whenever the drain loop frees
+	// buffer capacity. It uses a close-and-replace broadcast so every waiter
+	// wakes at once — a full buffer never thundering-herds request goroutines
+	// onto flushMu, and waiters do not burn CPU polling.
+	capacity *capacitySignal
+}
+
+// capacitySignal is a close-and-replace broadcast: signal() wakes every goroutine
+// currently waiting on channel() and arms a fresh channel for the next pass.
+type capacitySignal struct {
+	mu sync.Mutex
+	ch chan struct{}
+}
+
+func newCapacitySignal() *capacitySignal { return &capacitySignal{ch: make(chan struct{})} }
+
+// signal wakes all current waiters and prepares the next generation channel.
+func (s *capacitySignal) signal() {
+	s.mu.Lock()
+	close(s.ch)
+	s.ch = make(chan struct{})
+	s.mu.Unlock()
+}
+
+// channel returns the channel to select on for the next capacity signal.
+func (s *capacitySignal) channel() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ch
 }
 
 // NewRecordBuffer creates a record buffer.
@@ -145,6 +184,7 @@ func NewRecordBuffer(getDB func() *db.DB, threshold int, maxPending int32, maxLa
 		cancel:    cancel,
 		db:        getDB,
 	}
+	rb.capacity = newCapacitySignal()
 	rb.wg.Add(1)
 	go func() {
 		defer rb.wg.Done()
@@ -233,15 +273,18 @@ func replayWAL(getDB func() *db.DB, walPath string) error {
 		}
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), flushDBTimeout)
+	defer cancel()
+
 	var inserted int
 	if len(certs) > 0 {
-		inserted, err = d.BulkInsertCertRecords(certs)
+		inserted, err = d.BulkInsertCertRecordsCtx(ctx, certs)
 		if err != nil {
 			return err
 		}
 	}
 	if len(nonces) > 0 {
-		n, err := d.BulkStoreDANonces(nonces)
+		n, err := d.BulkStoreDANoncesCtx(ctx, nonces)
 		if err != nil {
 			return err
 		}
@@ -276,14 +319,53 @@ func (rb *RecordBuffer) IsFull() bool {
 	return rb.maxPending > 0 && rb.pending.Load() >= rb.maxPending
 }
 
+// fullWaitTimeout bounds how long a synchronous DA-nonce append waits for the
+// drain loop to free capacity before giving up and returning ErrBackpressure.
+var fullWaitTimeout = 5 * time.Second
+
+// waitForCapacity blocks until the buffer has room for one more record or the
+// wait times out. It never performs a synchronous flush itself: when the buffer
+// is full the drain loop is already flushing (every add signals flushCh), and a
+// request-path FlushAll would serialize every caller behind a single flushMu
+// hold — a thundering herd that freezes the whole server under sustained load.
+// Waiters sleep on the capacity broadcast instead of polling, so all wake the
+// moment the drain frees capacity. Returns ErrBackpressure when capacity cannot
+// be freed within fullWaitTimeout; callers should respond 503 so the client
+// retries.
+func (rb *RecordBuffer) waitForCapacity() error {
+	if !rb.IsFull() {
+		return nil
+	}
+	// Wake the drain loop so pending actually decreases while we wait.
+	select {
+	case rb.flushCh <- struct{}{}:
+	default:
+	}
+	timer := time.NewTimer(fullWaitTimeout)
+	defer timer.Stop()
+	for rb.IsFull() {
+		select {
+		case <-rb.capacity.channel():
+			// The drain freed (or refilled) capacity: re-signal it and re-check.
+			select {
+			case rb.flushCh <- struct{}{}:
+			default:
+			}
+		case <-timer.C:
+			return ErrBackpressure
+		}
+	}
+	return nil
+}
+
 // Pending returns the current number of records waiting to be flushed to the DB.
 func (rb *RecordBuffer) Pending() int32 {
 	return rb.pending.Load()
 }
 
 // WALEnabled reports whether the buffer has an active write-ahead log.
-// When false, unflushed data is not crash-safe and DA nonce storage falls
-// back to synchronous DB persistence.
+// When false, unflushed data is not crash-safe; DA nonces are buffered through
+// the batch pipeline (AddDANonce) and converge on the next bulk flush.
 func (rb *RecordBuffer) WALEnabled() bool { return rb.walFile != nil }
 
 // WalBytes returns the current size of the WAL file in bytes, or 0 when WAL is
@@ -389,14 +471,56 @@ func kindOf(item Item) string {
 	}
 }
 
+// AddDANonce buffers a DelegationAuthorization nonce into the batch write
+// pipeline for batched persistence (BulkStoreDANonces on the next flush), the
+// convergence model used by certificates and one-time nonces. Memory is
+// authoritative for replay checks, so a nonce stored here is immediately
+// visible to the engine even before the backend catches up.
+//
+// Unlike AddDANonceSync this performs no synchronous WAL/DB I/O: use it only
+// when the buffer has no WAL (non-file backends such as PostgreSQL/MySQL),
+// where a synchronous per-nonce INSERT was the per-request throughput wall
+// under AIC load. A full buffer is force-flushed first so the security-critical
+// nonce is never rejected (same guarantee as AddDANonceSync). Crash safety for
+// unflushed nonces is sacrificed by design on WAL-less backends — the backend
+// table converges on the next bulk flush.
+func (rb *RecordBuffer) AddDANonce(nonce []byte) error {
+	if len(nonce) != 32 {
+		return fmt.Errorf("add_da_nonce: nonce must be 32 bytes, got %d", len(nonce))
+	}
+	// Wait for the drain loop to free capacity instead of force-flushing
+	// synchronously: a request-path FlushAll under a full buffer thundering-herds
+	// every caller onto flushMu and freezes the server. A bounded wait keeps the
+	// nonce accepted whenever capacity can be freed in time; otherwise
+	// ErrBackpressure propagates so the caller returns 503 (issuance fails, so no
+	// certificate is minted and replay protection is never weakened).
+	if err := rb.waitForCapacity(); err != nil {
+		return err
+	}
+
+	rb.mu.Lock()
+	rb.records = append(rb.records, DANonceItem(nonce))
+	rb.mu.Unlock()
+	rb.pending.Add(1)
+
+	// Signal the drain loop so the batch converges to the DB promptly.
+	select {
+	case rb.flushCh <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
 // AddDANonceSync buffers a DelegationAuthorization nonce and synchronously
 // fsyncs the WAL before returning. DA nonce replay protection requires the
 // nonce to be durable once the caller's AIC issuance is acknowledged; the
 // periodic fsync (every N records) is not sufficient for that guarantee.
 //
 // The backend da_nonces table converges via the same batch pipeline on the
-// next flush. If the buffer is full, it is force-flushed first so the nonce is
-// always accepted. Returns ErrWALDisabled when the buffer has no WAL.
+// next flush. When the buffer is full, it waits for the drain loop to free
+// capacity (bounded) instead of force-flushing, so a full buffer never
+// thundering-herds request goroutines onto flushMu. Returns ErrWALDisabled when
+// the buffer has no WAL (use AddDANonce for the WAL-less batch path instead).
 func (rb *RecordBuffer) AddDANonceSync(nonce []byte) error {
 	if rb.walFile == nil {
 		return ErrWALDisabled
@@ -404,10 +528,8 @@ func (rb *RecordBuffer) AddDANonceSync(nonce []byte) error {
 	if len(nonce) != 32 {
 		return fmt.Errorf("add_da_nonce: nonce must be 32 bytes, got %d", len(nonce))
 	}
-	// Never reject a security-critical nonce: force a synchronous flush to
-	// free capacity first.
-	if rb.IsFull() {
-		rb.FlushAll()
+	if err := rb.waitForCapacity(); err != nil {
+		return err
 	}
 
 	line, err := json.Marshal(walLine{Kind: "da_nonce", Nonce: nonce})
@@ -456,6 +578,7 @@ func (rb *RecordBuffer) rollbackLast() {
 	}
 	rb.mu.Unlock()
 	rb.pending.Add(-1)
+	rb.capacity.signal()
 }
 
 func (rb *RecordBuffer) flush() {
@@ -495,12 +618,18 @@ func (rb *RecordBuffer) flushLocked() {
 		}
 	}
 
+	// Bound the backend writes by a context so a hung connection (half-open
+	// socket during a chunk INSERT) surfaces as an error that the drain loop
+	// retries on a fresh connection instead of holding flushMu forever.
+	ctx, cancel := context.WithTimeout(context.Background(), flushDBTimeout)
+	defer cancel()
+
 	var err error
 	if len(certs) > 0 {
-		_, err = d.BulkInsertCertRecords(certs)
+		_, err = d.BulkInsertCertRecordsCtx(ctx, certs)
 	}
 	if err == nil && len(nonces) > 0 {
-		_, err = d.BulkStoreDANonces(nonces)
+		_, err = d.BulkStoreDANoncesCtx(ctx, nonces)
 	}
 	if err != nil {
 		slog.Warn("record_buffer: bulk write failed", "n", len(batch), "error", err)
@@ -520,6 +649,7 @@ func (rb *RecordBuffer) flushLocked() {
 	}
 	rb.mu.Unlock()
 	rb.pending.Add(-int32(n))
+	rb.capacity.signal()
 
 	// Truncate the WAL when all records have been flushed to prevent unbounded WAL
 	// growth (on crash restart the entire file would be replayed, and a huge history

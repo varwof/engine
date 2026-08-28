@@ -137,6 +137,31 @@ func (d *DB) ListUsers() ([]UserInfo, error) {
 	return users, rows.Err()
 }
 
+// ListRBACUsers returns the full user rows (including credential columns and CA
+// scopes) — the startup source for the engine's in-memory user index.
+func (d *DB) ListRBACUsers() ([]RBACUser, error) {
+	rows, err := d.Query(`
+		SELECT id, username, password_hash, salt, role,
+		       COALESCE(ca_scopes, ''), COALESCE(operator_cert_pem, ''), enabled, created_at
+		FROM rbac_users ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var users []RBACUser
+	for rows.Next() {
+		var u RBACUser
+		var enabled int
+		if err := rows.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Salt, &u.Role,
+			&u.CAScopes, &u.OperatorCertPEM, &enabled, &u.CreatedAt); err != nil {
+			return nil, err
+		}
+		u.Enabled = enabled == 1
+		users = append(users, u)
+	}
+	return users, rows.Err()
+}
+
 func (d *DB) DeleteUser(id int) error {
 	d.Exec("DELETE FROM rbac_api_tokens WHERE user_id = ?", id)
 	_, err := d.Exec("DELETE FROM rbac_users WHERE id = ?", id)
@@ -242,6 +267,35 @@ func (d *DB) DeleteToken(id int) error {
 func (d *DB) DeleteTokenByHash(hash string) error {
 	_, err := d.Exec("DELETE FROM rbac_api_tokens WHERE token = ?", hash)
 	return err
+}
+
+// TokenHashRow is a single rbac_api_tokens row exposing only the SHA-256 token
+// hash (never raw token material) — the startup source for the engine's
+// in-memory token index.
+type TokenHashRow struct {
+	ID        int
+	TokenHash string
+	UserID    int
+	ExpiresAt *string
+}
+
+// ListAllTokenHashes returns every API token row (hash + owner + expiry). Used
+// by the engine to rebuild its in-memory token index on startup.
+func (d *DB) ListAllTokenHashes() ([]TokenHashRow, error) {
+	rows, err := d.Query("SELECT id, token, user_id, expires_at FROM rbac_api_tokens ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TokenHashRow
+	for rows.Next() {
+		var t TokenHashRow
+		if err := rows.Scan(&t.ID, &t.TokenHash, &t.UserID, &t.ExpiresAt); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }
 
 func (d *DB) LogAudit(username, remoteAddr, method, path, action, detail string) error {

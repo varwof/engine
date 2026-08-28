@@ -4,6 +4,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -61,6 +62,14 @@ func (d *DB) IsDANonceUsed(nonce []byte) (bool, error) {
 // silently ignored, mirroring StoreDANonce's idempotence for a single nonce.
 // This is the batched backend sink for the engine's DA nonce write pipeline.
 func (d *DB) BulkStoreDANonces(nonces [][]byte) (int, error) {
+	return d.BulkStoreDANoncesCtx(context.Background(), nonces)
+}
+
+// BulkStoreDANoncesCtx is the context-aware variant of BulkStoreDANonces. The
+// write pipeline passes a bounded context so a hung backend connection surfaces
+// as an error (context cleanup / driver timeout) instead of blocking the flush
+// indefinitely.
+func (d *DB) BulkStoreDANoncesCtx(ctx context.Context, nonces [][]byte) (int, error) {
 	for i, nc := range nonces {
 		if len(nc) != 32 {
 			return 0, fmt.Errorf("bulk_store_da_nonces: nonce %d must be 32 bytes, got %d", i, len(nc))
@@ -76,7 +85,7 @@ func (d *DB) BulkStoreDANonces(nonces [][]byte) (int, error) {
 		if size > len(nonces) {
 			size = len(nonces)
 		}
-		n, err := d.bulkStoreDANonceChunk(nonces[:size])
+		n, err := d.bulkStoreDANonceChunkCtx(ctx, nonces[:size])
 		if err != nil {
 			return total + n, err
 		}
@@ -87,6 +96,10 @@ func (d *DB) BulkStoreDANonces(nonces [][]byte) (int, error) {
 }
 
 func (d *DB) bulkStoreDANonceChunk(nonces [][]byte) (int, error) {
+	return d.bulkStoreDANonceChunkCtx(context.Background(), nonces)
+}
+
+func (d *DB) bulkStoreDANonceChunkCtx(ctx context.Context, nonces [][]byte) (int, error) {
 	n := len(nonces)
 	if n == 0 {
 		return 0, nil
@@ -109,7 +122,7 @@ func (d *DB) bulkStoreDANonceChunk(nonces [][]byte) (int, error) {
 	default: // sqlite
 		query = "INSERT OR IGNORE INTO da_nonces (nonce) VALUES " + values
 	}
-	res, err := d.Exec(query, args...)
+	res, err := d.ExecContext(ctx, query, args...)
 	if err != nil {
 		return 0, fmt.Errorf("bulk_store_da_nonces: %w", err)
 	}

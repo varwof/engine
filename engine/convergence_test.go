@@ -88,11 +88,9 @@ func verifyConvergence(t *testing.T, e *Engine) {
 
 	// Certificates: memory == backend, status for status.
 	memCerts := map[string]string{}
-	e.certIdx.mu.RLock()
-	for k, r := range e.certIdx.byKey {
+	for k, r := range e.certIdx.snapshotAll() {
 		memCerts[k.ca+"/"+k.serial] = r.Status
 	}
-	e.certIdx.mu.RUnlock()
 
 	backend, err := d.ListAllCerts()
 	if err != nil {
@@ -115,24 +113,17 @@ func verifyConvergence(t *testing.T, e *Engine) {
 	// in the future here, so none are pruned).
 	rev := e.revoked.Len()
 	rCount := 0
-	e.certIdx.mu.RLock()
-	for _, r := range e.certIdx.byKey {
+	for _, r := range e.certIdx.snapshotAll() {
 		if r.Status == "R" {
 			rCount++
 		}
 	}
-	e.certIdx.mu.RUnlock()
 	if rev != rCount {
 		t.Fatalf("revoked set (%d) != R certs in index (%d)", rev, rCount)
 	}
 
 	// Nonces: memory == backend, used flag for used flag.
-	memNonces := map[string]bool{}
-	e.nonces.mu.RLock()
-	for k, v := range e.nonces.entry {
-		memNonces[k] = v.used
-	}
-	e.nonces.mu.RUnlock()
+	memNonces := e.nonces.snapshotUsed()
 
 	beNonces, err := d.ListNonces()
 	if err != nil {

@@ -65,6 +65,7 @@
 | 函数 | 所在文件 |
 |---|---|
 | `(*RecordBuffer) Add(rec *db.CertRecord) bool` | record_buffer.go |
+| `(*RecordBuffer) AddDANonce(nonce []byte) error` | record_buffer.go — 无 WAL 批量路径：把 DA nonce 缓冲进写管道（经 `BulkStoreDANonces` 收敛）；永不拒绝（满则先强制 flush） |
 | `(*RecordBuffer) AddDANonceSync(nonce []byte) error` | record_buffer.go — 返回前同步 fsync WAL（DA nonce 崩溃安全）；无 WAL 返回 `ErrWALDisabled` |
 | `(*RecordBuffer) WALEnabled() bool` | record_buffer.go |
 | `(*RecordBuffer) Pending() int32` / `IsFull() bool` / `FlushAll()` / `Stop()` | record_buffer.go |
@@ -77,7 +78,34 @@
 | 函数 | 所在文件 |
 |---|---|
 | `(*DB) BulkStoreDANonces(nonces [][]byte) (int, error)` | da_nonces.go — 多行 INSERT，重复忽略，强制 32 字节 |
+| `(*DB) BulkStoreDANoncesCtx(ctx context.Context, nonces [][]byte) (int, error)` | da_nonces.go — ctx 感知变体（recordbuffer 批量 flush 使用，包 `flushDBTimeout` 兜底）；旧入口委托 `context.Background()` |
+| `(*DB) BulkInsertCertRecords(records []*CertRecord) (int, error)` / `BulkInsertCertRecordsCtx(ctx, records) (int, error)` | batch.go — 多行 INSERT（每块 `certChunkSize` 行）。PG/MySQL 块 = 500 行/条（往返降 ~13×），SQLite = 39 行/条（999 变量上限） |
+| `(*DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)` | db.go — ctx 感知的 rebind+adapt 批量 Exec（分块 Ctx 变体底层） |
 | `(*DB) BulkRevokeCertificates(entries []RevokeBatchEntry) (int, error)` | bulk_revoke.go — 每约 199 条分块一条 CASE UPDATE，承载每行 reason |
+
+## RBAC 用户 / API Token（2026-08-27 新增，认证内存化）
+
+内存即真相扩展：engine 启动时全量载入 rbac_users（全行）与 rbac_api_tokens
+（仅 SHA-256 hash，永不含明文 token），serve 认证读路径（authByToken /
+authByBasic / authFromAIC / gateway 委托）由 engine 优先、DB 回退。
+
+| 函数 | 所在文件 |
+|---|---|
+| `(*Engine) GetUserByUsername(username string) (*db.RBACUser, error)` | user_token.go — miss 返回 `ErrNotFound` |
+| `(*Engine) GetUserByID(id int) (*db.RBACUser, error)` | user_token.go — 写路径按 id 刷新驻留行 |
+| `(*Engine) GetToken(token string) (*db.TokenInfo, error)` | user_token.go — 内存校验 expiry + 用户 enabled（等同 `db.GetToken` 的 JOIN+WHERE） |
+| `(*Engine) PutUser(u *db.RBACUser)` | user_token.go — 写穿入口（创建/更新用户） |
+| `(*Engine) DeleteUserByID(id int)` | user_token.go |
+| `(*Engine) PutTokenHash(r db.TokenHashRow)` | user_token.go — 写穿入口（登录/建 token） |
+| `(*Engine) DeleteTokenByHash(hash string)` | user_token.go |
+| `(*Engine) DeleteTokenByID(id int)` | user_token.go |
+| `(*Engine) DeleteTokensByUserID(userID int)` | user_token.go — 密码轮换/删用户时清该账户全部 token |
+| `(*DB) ListRBACUsers() ([]RBACUser, error)` | db/rbac.go — 启动全量载入源（含凭据列） |
+| `(*DB) ListAllTokenHashes() ([]TokenHashRow, error)` | db/rbac.go — 启动全量载入源（hash+owner+expiry） |
+
+写路径约定：serve 先落 DB（拥有身份生成与写串行权），再刷新/删除驻留行，内存
+与后端保持一致。OOB（CLI/第二实例）创建的用户不在内存 → 认证回退 DB（与证书
+OOB 行为一致）。
 
 ## 子 CA / 信任锚 / AIC
 
@@ -110,8 +138,9 @@
   - `NewRevokedSet(maxPerCA int)`（engine/revoked_set.go）— `maxPerCA > 0` 时每 CA 超限逐出最旧吊销（状态仍 R，仅退出 CRL 窗口）
   - `NewNonceSet(max int)`（engine/nonce_set.go）— 16B RenewalToken nonce；DA nonce（32B）复用同一类型，语义为存在即已用（`has()` 查询），见 `engine/writes.go` `StoreDANonce`
   - `NewSubCAIndex()` / `NewTrustIndex()` / `NewAICIndex()`（engine/meta_index.go）— `AICIndex.ResidentBytes()`（R8）
+  - `NewUserIndex` 对应私有 `userIndex` / `tokenIndex`（engine/user_token.go）— 用户/Token 内存索引；`Metrics` 新增 `UserIndexSize` / `TokenIndexSize`
 
 ## 指标（Prometheus）
 
-- `varwof_engine_certindex_size` / `varwof_engine_revokedset_size` / `varwof_engine_nonceset_size` / `varwof_engine_danonceset_size` / `varwof_engine_subca_size` / `varwof_engine_trustanchor_size` / `varwof_engine_aic_size` / `varwof_engine_window_evictions_total` / `varwof_engine_read_hit_total` / `varwof_engine_read_miss_total` / `varwof_engine_pipeline_pending` / `varwof_engine_flush_duration_seconds`（直方图）
+- `varwof_engine_certindex_size` / `varwof_engine_revokedset_size` / `varwof_engine_nonceset_size` / `varwof_engine_danonceset_size` / `varwof_engine_subca_size` / `varwof_engine_trustanchor_size` / `varwof_engine_aic_size` / **`varwof_engine_userindex_size` / `varwof_engine_tokenindex_size`**（2026-08-27 新增，未渲染进 Prometheus 输出，仅 `Metrics()`）/ `varwof_engine_window_evictions_total` / `varwof_engine_read_hit_total` / `varwof_engine_read_miss_total` / `varwof_engine_pipeline_pending` / `varwof_engine_flush_duration_seconds`（直方图）
 - R8/R10 新增：**`varwof_engine_aic_pruned_total`** / **`varwof_engine_cert_issued_total`** / **`varwof_engine_cert_revoked_total`** / **`varwof_engine_cert_resident_bytes`** / **`varwof_engine_aic_resident_bytes`** / **`varwof_engine_wal_bytes`**

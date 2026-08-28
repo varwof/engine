@@ -4,6 +4,7 @@
 package db
 
 import (
+	"context"
 	"strings"
 	"time"
 )
@@ -26,8 +27,22 @@ func (p *certRecordPoolT) Get() *CertRecord {
 const maxSQLVars = 999
 
 func (d *DB) BulkInsertCertRecords(records []*CertRecord) (int, error) {
-	// Chunk to avoid SQLite's variable limit
-	chunkSize := maxSQLVars / rowCols
+	return d.BulkInsertCertRecordsCtx(context.Background(), records)
+}
+
+// BulkInsertCertRecordsCtx is the context-aware variant of
+// BulkInsertCertRecords. The write pipeline passes a bounded context so a hung
+// backend connection surfaces as an error (context cleanup / driver timeout)
+// instead of blocking the flush indefinitely — the record buffer otherwise
+// wedges with flushMu held and pending pinned at maxPending.
+func (d *DB) BulkInsertCertRecordsCtx(ctx context.Context, records []*CertRecord) (int, error) {
+	// Chunk size is dialect-aware: SQLite caps variables per query at 999, while
+	// PG (65,535) and MySQL (packet-bounded) tolerate far more placeholders.
+	// Using 500-row chunks on PG/MySQL cuts the number of round-trips ~13× vs the
+	// 39-row SQLite chunk, which raises both steady-state flush throughput and
+	// how fast a huge backlog drains at shutdown. A 500-row MySQL statement is
+	// ~1-1.5MB of wire data, well under a 16MB max_allowed_packet.
+	chunkSize := certChunkSize(d.dialect)
 	if chunkSize <= 0 {
 		chunkSize = 45
 	}
@@ -37,7 +52,7 @@ func (d *DB) BulkInsertCertRecords(records []*CertRecord) (int, error) {
 		if size > len(records) {
 			size = len(records)
 		}
-		n, err := d.bulkInsertChunk(records[:size])
+		n, err := d.bulkInsertChunkCtx(ctx, records[:size])
 		if err != nil {
 			return total + n, err
 		}
@@ -47,7 +62,23 @@ func (d *DB) BulkInsertCertRecords(records []*CertRecord) (int, error) {
 	return total, nil
 }
 
+// certChunkSize returns the maximum certificates per bulk INSERT statement for
+// a dialect. SQLite is bound by its 999-parameter-per-query limit; PG and MySQL
+// allow larger statements and benefit from bigger chunks.
+func certChunkSize(d Dialect) int {
+	switch d.DriverName() {
+	case "pgx", "mysql":
+		return 500
+	default: // sqlite
+		return maxSQLVars / rowCols
+	}
+}
+
 func (d *DB) bulkInsertChunk(records []*CertRecord) (int, error) {
+	return d.bulkInsertChunkCtx(context.Background(), records)
+}
+
+func (d *DB) bulkInsertChunkCtx(ctx context.Context, records []*CertRecord) (int, error) {
 	if len(records) == 0 {
 		return 0, nil
 	}
@@ -83,7 +114,7 @@ func (d *DB) bulkInsertChunk(records []*CertRecord) (int, error) {
 	// Build the final SQL.
 	query := bulkInsertSQL(d.dialect, n)
 
-	res, err := d.Exec(query, args...)
+	res, err := d.ExecContext(ctx, query, args...)
 	if err != nil {
 		return 0, err
 	}

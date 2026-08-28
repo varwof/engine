@@ -7,6 +7,7 @@ import (
 	"container/heap"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/varwof/engine/db"
@@ -31,27 +32,46 @@ type caCNKey struct {
 	cn string
 }
 
-// CertIndex is the primary in-memory certificate index. All certificates
-// (valid and revoked) that have not yet expired out of the hot window live
-// here. Records are immutable once published: revocation publishes a clone
-// (copy-on-write) that replaces the original in every index, so readers
-// holding a pre-revocation pointer observe a stable snapshot. Only the
-// eviction-window heap retains the original instance until eviction.
-type CertIndex struct {
-	mu sync.RWMutex
+// certIndexShards is the number of shards backing CertIndex. Each shard owns
+// the full secondary-index entries for a subset of primary keys (chosen by
+// FNV-1a hash of ca+serial), so per-record insert/lookup/revoke only contends
+// on that shard's lock instead of a single global one. This removes the
+// single-lock queueing that previously dominated engine mutex wait under AIC
+// load (~60% of it; RISKS R5).
+const certIndexShards = 16
 
-	byKey    map[certKey]*db.CertRecord
+// certIndexShard is one independently-locked slice of the certificate index.
+type certIndexShard struct {
+	mu    sync.RWMutex
+	byKey map[certKey]*db.CertRecord
+	// Secondary indexes: each record's secondary entries live in the same
+	// shard as its primary key, so point mutations stay single-shard.
 	byIssuer map[issuerKey]*db.CertRecord
 	bySPKI   map[string]map[*db.CertRecord]struct{}
 	byAgent  map[string]map[*db.CertRecord]struct{}
 	byUid    map[string]map[*db.CertRecord]struct{}
 	byCAcn   map[caCNKey]map[*db.CertRecord]struct{}
 	windows  map[string]*certHeap // ca -> min-heap by NotAfter asc (eviction order)
+}
 
-	// residentBytes is an estimate of the resident memory attributable to the
-	// records in this index (see estimateRecordBytes). It is maintained under
-	// mu and used to enforce the MaxResidentBytes byte budget.
-	residentBytes int64
+// CertIndex is the primary in-memory certificate index. All certificates
+// (valid and revoked) that have not yet expired out of the hot window live
+// here. Records are immutable once published: revocation publishes a clone
+// (copy-on-write) that replaces the original in every index, so readers
+// holding a pre-revocation pointer observe a stable snapshot. Only the
+// eviction-window heap retains the original instance until eviction.
+//
+// The index is sharded by primary-key hash: each shard has its own lock, and a
+// record and all its secondary entries always live in one shard. Cross-shard
+// secondary lookups (by SPKI/UID/agent/CN/issuer) scan every shard and merge;
+// those paths are rare relative to the write path that the sharding protects.
+type CertIndex struct {
+	shards [certIndexShards]*certIndexShard
+
+	// count / residentBytes are global, atomically tracked estimates used to
+	// enforce the MaxCerts / MaxResidentBytes budgets across all shards.
+	count         atomic.Int64
+	residentBytes atomic.Int64
 }
 
 // estimateRecordBytes returns a conservative estimate of the resident memory a
@@ -71,109 +91,149 @@ func estimateRecordBytes(r *db.CertRecord) int64 {
 	return n
 }
 
-// ResidentBytes returns the estimated resident bytes of the certificate index.
-func (i *CertIndex) ResidentBytes() int64 {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
-	return i.residentBytes
+// shardForCertKey returns the shard index owning a primary key.
+func shardForCertKey(ca, serial string) int {
+	h := uint32(2166136261)
+	for i := 0; i < len(ca); i++ {
+		h ^= uint32(ca[i])
+		h *= 16777619
+	}
+	h ^= 0x00
+	h *= 16777619
+	for i := 0; i < len(serial); i++ {
+		h ^= uint32(serial[i])
+		h *= 16777619
+	}
+	return int(h & (certIndexShards - 1))
 }
+
+func (i *CertIndex) shardForKey(k certKey) *certIndexShard {
+	return i.shards[shardForCertKey(k.ca, k.serial)]
+}
+
+// ResidentBytes returns the estimated resident bytes of the certificate index.
+func (i *CertIndex) ResidentBytes() int64 { return i.residentBytes.Load() }
 
 // NewCertIndex creates an empty certificate index.
 func NewCertIndex() *CertIndex {
-	return &CertIndex{
-		byKey:    make(map[certKey]*db.CertRecord),
-		byIssuer: make(map[issuerKey]*db.CertRecord),
-		bySPKI:   make(map[string]map[*db.CertRecord]struct{}),
-		byAgent:  make(map[string]map[*db.CertRecord]struct{}),
-		byUid:    make(map[string]map[*db.CertRecord]struct{}),
-		byCAcn:   make(map[caCNKey]map[*db.CertRecord]struct{}),
-		windows:  make(map[string]*certHeap),
+	idx := &CertIndex{}
+	for s := range idx.shards {
+		idx.shards[s] = &certIndexShard{
+			byKey:    make(map[certKey]*db.CertRecord),
+			byIssuer: make(map[issuerKey]*db.CertRecord),
+			bySPKI:   make(map[string]map[*db.CertRecord]struct{}),
+			byAgent:  make(map[string]map[*db.CertRecord]struct{}),
+			byUid:    make(map[string]map[*db.CertRecord]struct{}),
+			byCAcn:   make(map[caCNKey]map[*db.CertRecord]struct{}),
+			windows:  make(map[string]*certHeap),
+		}
 	}
+	return idx
 }
 
-func (i *CertIndex) Len() int {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
-	return len(i.byKey)
-}
+func (i *CertIndex) Len() int { return int(i.count.Load()) }
 
 // put inserts a record into the primary and all secondary indexes. It must be
 // called only for records not already present.
 func (i *CertIndex) put(r *db.CertRecord) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	i.putLocked(r)
+	sh := i.shardForKey(certKey{ca: r.CAName, serial: r.SerialNumber})
+	sh.mu.Lock()
+	sh.putLocked(r)
+	sh.mu.Unlock()
+	i.count.Add(1)
+	i.residentBytes.Add(estimateRecordBytes(r))
 }
 
-// insertIfAbsent inserts r atomically under the index lock, so concurrent
+// insertIfAbsent inserts r atomically under its shard lock, so concurrent
 // IssueCert calls for the same (ca, serial) resolve consistently: exactly one
 // wins the slot and others observe the existing record. When maxCerts > 0 and
 // the index is at capacity, expired certificates (NotAfter < cutoff) are
 // evicted first; if none can be evicted the insert is rejected with
 // ErrBackpressure. The same holds for maxBytes (estimated resident byte
-// budget). evicted reports how many expired certificates were removed.
+// budget). evicted reports how many expired certificates were removed. The
+// capacity budget is global (tracked atomically across shards) and checked
+// before and after the shard lock; the bound is approximate under heavy
+// concurrency, matching the NonceSet capacity semantics.
 func (i *CertIndex) insertIfAbsent(r *db.CertRecord, maxCerts int, maxBytes int64, cutoff time.Time) (existing *db.CertRecord, inserted bool, evicted int, err error) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	k := certKey{ca: r.CAName, serial: r.SerialNumber}
-	if existing, ok := i.byKey[k]; ok {
-		return existing, false, 0, nil
-	}
-	if (maxCerts > 0 && len(i.byKey) >= maxCerts) ||
-		(maxBytes > 0 && i.residentBytes+estimateRecordBytes(r) > maxBytes) {
-		keys := i.evictExpiredLocked(cutoff)
-		evicted = len(keys)
-		if (maxCerts > 0 && len(i.byKey) >= maxCerts) ||
-			(maxBytes > 0 && i.residentBytes+estimateRecordBytes(r) > maxBytes) {
-			return nil, false, evicted, ErrBackpressure
+	if maxCerts > 0 || maxBytes > 0 {
+		if i.overBudget(maxCerts, maxBytes, estimateRecordBytes(r)) {
+			evicted = len(i.evictExpired(cutoff))
+			if i.overBudget(maxCerts, maxBytes, estimateRecordBytes(r)) {
+				return nil, false, evicted, ErrBackpressure
+			}
 		}
 	}
-	i.putLocked(r)
+	k := certKey{ca: r.CAName, serial: r.SerialNumber}
+	sh := i.shardForKey(k)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if existing, ok := sh.byKey[k]; ok {
+		return existing, false, 0, nil
+	}
+	if maxCerts > 0 || maxBytes > 0 {
+		if i.overBudget(maxCerts, maxBytes, estimateRecordBytes(r)) {
+			return nil, false, 0, ErrBackpressure
+		}
+	}
+	sh.putLocked(r)
+	i.count.Add(1)
+	i.residentBytes.Add(estimateRecordBytes(r))
 	return nil, true, evicted, nil
 }
 
-func (i *CertIndex) putLocked(r *db.CertRecord) {
+func (i *CertIndex) overBudget(maxCerts int, maxBytes int64, est int64) bool {
+	if maxCerts > 0 && i.count.Load() >= int64(maxCerts) {
+		return true
+	}
+	if maxBytes > 0 && i.residentBytes.Load()+est > maxBytes {
+		return true
+	}
+	return false
+}
+
+// putLocked inserts a record into the shard's primary and all secondary
+// indexes. The caller must hold the shard lock.
+func (sh *certIndexShard) putLocked(r *db.CertRecord) {
 	k := certKey{ca: r.CAName, serial: r.SerialNumber}
-	i.byKey[k] = r
-	i.residentBytes += estimateRecordBytes(r)
+	sh.byKey[k] = r
 
 	if r.IssuerDN != "" {
-		i.byIssuer[issuerKey{issuerDN: r.IssuerDN, serial: r.SerialNumber}] = r
+		sh.byIssuer[issuerKey{issuerDN: r.IssuerDN, serial: r.SerialNumber}] = r
 	}
 	if r.SPKIHash != "" {
-		m := i.bySPKI[r.SPKIHash]
+		m := sh.bySPKI[r.SPKIHash]
 		if m == nil {
 			m = make(map[*db.CertRecord]struct{})
-			i.bySPKI[r.SPKIHash] = m
+			sh.bySPKI[r.SPKIHash] = m
 		}
 		m[r] = struct{}{}
 	}
 	if r.AgentId != "" {
-		m := i.byAgent[r.AgentId]
+		m := sh.byAgent[r.AgentId]
 		if m == nil {
 			m = make(map[*db.CertRecord]struct{})
-			i.byAgent[r.AgentId] = m
+			sh.byAgent[r.AgentId] = m
 		}
 		m[r] = struct{}{}
 	}
 	if r.PrincipalUid != "" {
-		m := i.byUid[r.PrincipalUid]
+		m := sh.byUid[r.PrincipalUid]
 		if m == nil {
 			m = make(map[*db.CertRecord]struct{})
-			i.byUid[r.PrincipalUid] = m
+			sh.byUid[r.PrincipalUid] = m
 		}
 		m[r] = struct{}{}
 	}
 	if r.CommonName != "" {
 		key := caCNKey{ca: r.CAName, cn: r.CommonName}
-		m := i.byCAcn[key]
+		m := sh.byCAcn[key]
 		if m == nil {
 			m = make(map[*db.CertRecord]struct{})
-			i.byCAcn[key] = m
+			sh.byCAcn[key] = m
 		}
 		m[r] = struct{}{}
 	}
-	i.windowInsertLocked(r)
+	sh.windowInsertLocked(r)
 }
 
 // certHeap is a min-heap over *db.CertRecord ordered by NotAfter ascending,
@@ -198,32 +258,37 @@ func (h *certHeap) Pop() any {
 	return x
 }
 
-// windowInsertLocked inserts a record into its CA's NotAfter min-heap in
-// O(log n), keeping the eviction window ordered by expiry without a linear
-// slice shift.
-func (i *CertIndex) windowInsertLocked(r *db.CertRecord) {
-	h := i.windows[r.CAName]
+func (sh *certIndexShard) windowInsertLocked(r *db.CertRecord) {
+	h := sh.windows[r.CAName]
 	if h == nil {
 		h = &certHeap{}
-		i.windows[r.CAName] = h
+		sh.windows[r.CAName] = h
 	}
 	heap.Push(h, r)
 }
 
 // get returns the certificate by (ca, serial). Second return reports presence.
 func (i *CertIndex) get(ca, serial string) (*db.CertRecord, bool) {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
-	r, ok := i.byKey[certKey{ca: ca, serial: serial}]
+	sh := i.shardForKey(certKey{ca: ca, serial: serial})
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	r, ok := sh.byKey[certKey{ca: ca, serial: serial}]
 	return r, ok
 }
 
-// getByIssuer returns the certificate by issuer DN + serial.
+// getByIssuer returns the certificate by issuer DN + serial. The issuer key
+// does not carry the CA, so every shard is searched.
 func (i *CertIndex) getByIssuer(issuerDN, serial string) (*db.CertRecord, bool) {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
-	r, ok := i.byIssuer[issuerKey{issuerDN: issuerDN, serial: serial}]
-	return r, ok
+	ik := issuerKey{issuerDN: issuerDN, serial: serial}
+	for _, sh := range i.shards {
+		sh.mu.RLock()
+		r, ok := sh.byIssuer[ik]
+		sh.mu.RUnlock()
+		if ok {
+			return r, true
+		}
+	}
+	return nil, false
 }
 
 // CertCursor is an opaque pagination cursor for high-cardinality certificate
@@ -234,32 +299,6 @@ func (i *CertIndex) getByIssuer(issuerDN, serial string) (*db.CertRecord, bool) 
 type CertCursor struct {
 	NotBefore time.Time
 	Serial    string
-}
-
-// getBySPKI returns certificates for a spki_hash, optionally filtered by CA
-// name and status, sorted by NotBefore descending. limit <= 0 returns the full
-// matching set. When limit bounds the page, the returned cursor resumes from
-// the last record and hasMore reports whether another page exists.
-func (i *CertIndex) getBySPKI(spkiHash, caName, status string, limit int, after *CertCursor) ([]*db.CertRecord, *CertCursor, bool) {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
-	return filterSortedSetPage(i.bySPKI[spkiHash], caName, status, limit, after)
-}
-
-// getByUid returns certificates for a principal_uid, optionally filtered by
-// status, sorted by NotBefore descending. See getBySPKI for pagination.
-func (i *CertIndex) getByUid(uid, status string, limit int, after *CertCursor) ([]*db.CertRecord, *CertCursor, bool) {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
-	return filterSortedSetPage(i.byUid[uid], "", status, limit, after)
-}
-
-// getByAgent returns certificates for an agent_id, optionally filtered by
-// status, sorted by NotBefore descending. See getBySPKI for pagination.
-func (i *CertIndex) getByAgent(agent, status string, limit int, after *CertCursor) ([]*db.CertRecord, *CertCursor, bool) {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
-	return filterSortedSetPage(i.byAgent[agent], "", status, limit, after)
 }
 
 // certAfterCursor reports whether r sorts after the cursor position under the
@@ -273,6 +312,51 @@ func certAfterCursor(r *db.CertRecord, c *CertCursor) bool {
 		return true
 	}
 	return r.NotBefore.Equal(c.NotBefore) && r.SerialNumber < c.Serial
+}
+
+// getBySPKI returns certificates for a spki_hash, optionally filtered by CA
+// name and status, sorted by NotBefore descending. limit <= 0 returns the full
+// matching set. When limit bounds the page, the returned cursor resumes from
+// the last record and hasMore reports whether another page exists. The SPKI
+// index is sharded, so each shard's matching set is merged first.
+func (i *CertIndex) getBySPKI(spkiHash, caName, status string, limit int, after *CertCursor) ([]*db.CertRecord, *CertCursor, bool) {
+	merged := make(map[*db.CertRecord]struct{})
+	for _, sh := range i.shards {
+		sh.mu.RLock()
+		for r := range sh.bySPKI[spkiHash] {
+			merged[r] = struct{}{}
+		}
+		sh.mu.RUnlock()
+	}
+	return filterSortedSetPage(merged, caName, status, limit, after)
+}
+
+// getByUid returns certificates for a principal_uid, optionally filtered by
+// status, sorted by NotBefore descending. See getBySPKI for pagination.
+func (i *CertIndex) getByUid(uid, status string, limit int, after *CertCursor) ([]*db.CertRecord, *CertCursor, bool) {
+	merged := make(map[*db.CertRecord]struct{})
+	for _, sh := range i.shards {
+		sh.mu.RLock()
+		for r := range sh.byUid[uid] {
+			merged[r] = struct{}{}
+		}
+		sh.mu.RUnlock()
+	}
+	return filterSortedSetPage(merged, "", status, limit, after)
+}
+
+// getByAgent returns certificates for an agent_id, optionally filtered by
+// status, sorted by NotBefore descending. See getBySPKI for pagination.
+func (i *CertIndex) getByAgent(agent, status string, limit int, after *CertCursor) ([]*db.CertRecord, *CertCursor, bool) {
+	merged := make(map[*db.CertRecord]struct{})
+	for _, sh := range i.shards {
+		sh.mu.RLock()
+		for r := range sh.byAgent[agent] {
+			merged[r] = struct{}{}
+		}
+		sh.mu.RUnlock()
+	}
+	return filterSortedSetPage(merged, "", status, limit, after)
 }
 
 // filterSortedSetPage filters and sorts a secondary-index set without doing a
@@ -371,15 +455,19 @@ func sortCertRecords(recs []*db.CertRecord) {
 	})
 }
 
-// getActiveByCN returns active (status='V') certificates for a CA + CN.
+// getActiveByCN returns active (status='V') certificates for a CA + CN across
+// all shards.
 func (i *CertIndex) getActiveByCN(ca, cn string) []*db.CertRecord {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
 	var out []*db.CertRecord
-	for r := range i.byCAcn[caCNKey{ca: ca, cn: cn}] {
-		if r.Status == "V" {
-			out = append(out, r)
+	key := caCNKey{ca: ca, cn: cn}
+	for _, sh := range i.shards {
+		sh.mu.RLock()
+		for r := range sh.byCAcn[key] {
+			if r.Status == "V" {
+				out = append(out, r)
+			}
 		}
+		sh.mu.RUnlock()
 	}
 	return out
 }
@@ -396,29 +484,38 @@ type revokePair struct {
 // The returned record is the published (revoked) clone; the pre-revocation
 // instance is left untouched for any reader that already holds it.
 func (i *CertIndex) setRevoked(ca, serial string, now time.Time, reason int) (*db.CertRecord, bool) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	return i.setRevokedLocked(certKey{ca: ca, serial: serial}, now, reason)
+	k := certKey{ca: ca, serial: serial}
+	sh := i.shardForKey(k)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	return sh.setRevokedLocked(k, now, reason)
 }
 
-// bulkSetRevoked marks a set of certificates revoked under a single lock
-// acquisition (the revocation-storm fast path). For each pair it reports the
-// published (revoked) record when the cert was active, and the keys that are
-// not resident in memory (so callers can distinguish "already revoked" from
-// "not resident"). Non-active or already-revoked certs are skipped.
+// bulkSetRevoked marks a set of certificates revoked, grouping pairs by shard
+// so each shard is locked once. For each pair it reports the published
+// (revoked) record when the cert was active, and the keys that are not
+// resident in memory (so callers can distinguish "already revoked" from "not
+// resident"). Non-active or already-revoked certs are skipped.
 func (i *CertIndex) bulkSetRevoked(pairs []revokePair, now time.Time) (revoked []*db.CertRecord, missing []certKey) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	revoked = make([]*db.CertRecord, 0, len(pairs))
+	byShard := make(map[*certIndexShard][]revokePair)
 	for _, p := range pairs {
-		k := certKey{ca: p.CA, serial: p.Serial}
-		if _, ok := i.byKey[k]; !ok {
-			missing = append(missing, k)
-			continue
+		sh := i.shardForKey(certKey{ca: p.CA, serial: p.Serial})
+		byShard[sh] = append(byShard[sh], p)
+	}
+	revoked = make([]*db.CertRecord, 0, len(pairs))
+	for sh, ps := range byShard {
+		sh.mu.Lock()
+		for _, p := range ps {
+			k := certKey{ca: p.CA, serial: p.Serial}
+			if _, ok := sh.byKey[k]; !ok {
+				missing = append(missing, k)
+				continue
+			}
+			if clone, ok := sh.setRevokedLocked(k, now, p.Reason); ok {
+				revoked = append(revoked, clone)
+			}
 		}
-		if clone, ok := i.setRevokedLocked(k, now, p.Reason); ok {
-			revoked = append(revoked, clone)
-		}
+		sh.mu.Unlock()
 	}
 	return revoked, missing
 }
@@ -428,9 +525,11 @@ func (i *CertIndex) bulkSetRevoked(pairs []revokePair, now time.Time) (revoked [
 // and replaces the original in every index (copy-on-write), so concurrent
 // readers that already hold the old pointer observe a stable pre-revocation
 // snapshot and never see a half-updated record. Returns the published clone.
-// The caller must hold the index lock.
-func (i *CertIndex) setRevokedLocked(key certKey, now time.Time, reason int) (*db.CertRecord, bool) {
-	old, ok := i.byKey[key]
+// The caller must hold the shard lock. (The resident-byte estimate is not
+// adjusted for the clone; the fields that change contribute a negligible delta
+// to the conservative budget estimate.)
+func (sh *certIndexShard) setRevokedLocked(key certKey, now time.Time, reason int) (*db.CertRecord, bool) {
+	old, ok := sh.byKey[key]
 	if !ok || old.Status == "R" {
 		return nil, false
 	}
@@ -439,161 +538,189 @@ func (i *CertIndex) setRevokedLocked(key certKey, now time.Time, reason int) (*d
 	clone.RevokedAt = &now
 	clone.RevokeReason = &reason
 	clone.InvalidityDate = &now
-	i.replaceLocked(old, &clone)
+	sh.replaceLocked(old, &clone)
 	return &clone, true
 }
 
 // replaceLocked swaps the published instance of a record for a new instance
-// across the primary and all secondary indexes. The eviction-window heap keeps
-// the old instance (a stable pre-replacement snapshot); removeLocked resolves
-// the current instance by key so pointer-keyed deletions still match. The
-// caller must hold the index lock.
-func (i *CertIndex) replaceLocked(old, new *db.CertRecord) {
+// across the primary and all secondary indexes of the shard. The eviction-window
+// heap keeps the old instance (a stable pre-replacement snapshot);
+// removeLocked resolves the current instance by key so pointer-keyed deletions
+// still match. The caller must hold the shard lock.
+func (sh *certIndexShard) replaceLocked(old, new *db.CertRecord) {
 	k := certKey{ca: old.CAName, serial: old.SerialNumber}
-	i.byKey[k] = new
-	i.residentBytes -= estimateRecordBytes(old)
-	i.residentBytes += estimateRecordBytes(new)
+	sh.byKey[k] = new
 
 	if old.IssuerDN != "" {
 		ik := issuerKey{issuerDN: old.IssuerDN, serial: old.SerialNumber}
-		delete(i.byIssuer, ik)
-		i.byIssuer[ik] = new
+		delete(sh.byIssuer, ik)
+		sh.byIssuer[ik] = new
 	}
 	if old.SPKIHash != "" {
-		m := i.bySPKI[old.SPKIHash]
+		m := sh.bySPKI[old.SPKIHash]
 		delete(m, old)
 		m[new] = struct{}{}
 	}
 	if old.AgentId != "" {
-		m := i.byAgent[old.AgentId]
+		m := sh.byAgent[old.AgentId]
 		delete(m, old)
 		m[new] = struct{}{}
 	}
 	if old.PrincipalUid != "" {
-		m := i.byUid[old.PrincipalUid]
+		m := sh.byUid[old.PrincipalUid]
 		delete(m, old)
 		m[new] = struct{}{}
 	}
 	if old.CommonName != "" {
-		m := i.byCAcn[caCNKey{ca: old.CAName, cn: old.CommonName}]
+		m := sh.byCAcn[caCNKey{ca: old.CAName, cn: old.CommonName}]
 		delete(m, old)
 		m[new] = struct{}{}
 	}
 }
 
 // bulkSetRevokedByUid marks every active certificate of a principal revoked
-// and returns them. The mutation runs under the index lock (single revoke uses
-// the same helper), so bulk revocation is race-free against concurrent reads.
+// and returns them. Each shard is locked in turn; bulk revocation is race-free
+// against concurrent reads on the same shard.
 func (i *CertIndex) bulkSetRevokedByUid(uid string, now time.Time, reason int) []*db.CertRecord {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 	var out []*db.CertRecord
-	for r := range i.byUid[uid] {
-		if r.Status == "V" {
-			k := certKey{ca: r.CAName, serial: r.SerialNumber}
-			if clone, ok := i.setRevokedLocked(k, now, reason); ok {
-				out = append(out, clone)
+	for _, sh := range i.shards {
+		sh.mu.Lock()
+		for r := range sh.byUid[uid] {
+			if r.Status == "V" {
+				k := certKey{ca: r.CAName, serial: r.SerialNumber}
+				if clone, ok := sh.setRevokedLocked(k, now, reason); ok {
+					out = append(out, clone)
+				}
 			}
 		}
+		sh.mu.Unlock()
 	}
 	return out
 }
 
 // bulkSetRevokedByCA marks every active certificate issued by a CA revoked and
-// returns them. The mutation runs under the index lock.
+// returns them. Each shard is locked in turn.
 func (i *CertIndex) bulkSetRevokedByCA(caName string, now time.Time, reason int) []*db.CertRecord {
-	i.mu.Lock()
-	defer i.mu.Unlock()
 	var out []*db.CertRecord
-	for _, r := range i.byKey {
-		if r.CAName == caName && r.Status == "V" {
-			k := certKey{ca: r.CAName, serial: r.SerialNumber}
-			if clone, ok := i.setRevokedLocked(k, now, reason); ok {
-				out = append(out, clone)
+	for _, sh := range i.shards {
+		sh.mu.Lock()
+		for _, r := range sh.byKey {
+			if r.CAName == caName && r.Status == "V" {
+				k := certKey{ca: r.CAName, serial: r.SerialNumber}
+				if clone, ok := sh.setRevokedLocked(k, now, reason); ok {
+					out = append(out, clone)
+				}
 			}
 		}
+		sh.mu.Unlock()
 	}
 	return out
 }
 
 // evictExpired removes every certificate whose NotAfter is strictly before
-// cutoff from all indexes. It uses each CA's NotAfter-sorted window to find
-// the eviction boundary in O(log n), then drops those records from the
-// secondary maps. Returns the evicted certificates' primary keys so callers
-// (e.g. the janitor) can cascade-clean related rows such as AIC extensions.
+// cutoff from all indexes, shard by shard. It uses each CA's NotAfter-sorted
+// window to find the eviction boundary in O(log n), then drops those records
+// from the secondary maps. Returns the evicted certificates' primary keys so
+// callers (e.g. the janitor) can cascade-clean related rows such as AIC
+// extensions.
 func (i *CertIndex) evictExpired(cutoff time.Time) []certKey {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	return i.evictExpiredLocked(cutoff)
+	var evicted []certKey
+	for _, sh := range i.shards {
+		sh.mu.Lock()
+		for _, r := range sh.evictExpiredLocked(cutoff) {
+			evicted = append(evicted, certKey{ca: r.CAName, serial: r.SerialNumber})
+			i.count.Add(-1)
+			i.residentBytes.Add(-estimateRecordBytes(r))
+		}
+		sh.mu.Unlock()
+	}
+	return evicted
 }
 
-// evictExpiredLocked is evictExpired with the index lock already held.
-func (i *CertIndex) evictExpiredLocked(cutoff time.Time) []certKey {
-	var evicted []certKey
-	for ca, h := range i.windows {
+// evictExpiredLocked pops expired records from the shard's eviction windows
+// and removes them from the shard's indexes. Returns the removed (current
+// published) records; the caller updates the global counters. The caller must
+// hold the shard lock.
+func (sh *certIndexShard) evictExpiredLocked(cutoff time.Time) []*db.CertRecord {
+	var removed []*db.CertRecord
+	for ca, h := range sh.windows {
 		if h == nil || h.Len() == 0 {
 			continue
 		}
 		// Heap top is the earliest NotAfter; pop while it is expired.
 		for h.Len() > 0 && (*h)[0].NotAfter.Before(cutoff) {
 			r := heap.Pop(h).(*db.CertRecord)
-			i.removeLocked(r)
-			evicted = append(evicted, certKey{ca: r.CAName, serial: r.SerialNumber})
+			sh.removeLocked(r)
+			removed = append(removed, r)
 		}
 		if h.Len() == 0 {
-			delete(i.windows, ca)
+			delete(sh.windows, ca)
 		}
 	}
-	return evicted
+	return removed
 }
 
-// removeLocked removes a record from the primary and all secondary indexes.
-// The eviction-window heap may hold a pre-revocation pointer (copy-on-write
-// revocation never re-publishes into the heap), so the current published
-// instance is resolved by primary key before the pointer-keyed deletions run.
-func (i *CertIndex) removeLocked(r *db.CertRecord) {
+// removeLocked removes a record from the shard's primary and all secondary
+// indexes. The eviction-window heap may hold a pre-revocation pointer
+// (copy-on-write revocation never re-publishes into the heap), so the current
+// published instance is resolved by primary key before the pointer-keyed
+// deletions run. The caller must hold the shard lock.
+func (sh *certIndexShard) removeLocked(r *db.CertRecord) {
 	k := certKey{ca: r.CAName, serial: r.SerialNumber}
-	cur, ok := i.byKey[k]
+	cur, ok := sh.byKey[k]
 	if !ok {
 		return // already removed
 	}
 	r = cur
-	delete(i.byKey, k)
-	i.residentBytes -= estimateRecordBytes(r)
+	delete(sh.byKey, k)
 	if r.IssuerDN != "" {
-		delete(i.byIssuer, issuerKey{issuerDN: r.IssuerDN, serial: r.SerialNumber})
+		delete(sh.byIssuer, issuerKey{issuerDN: r.IssuerDN, serial: r.SerialNumber})
 	}
 	if r.SPKIHash != "" {
-		if m := i.bySPKI[r.SPKIHash]; m != nil {
+		if m := sh.bySPKI[r.SPKIHash]; m != nil {
 			delete(m, r)
 			if len(m) == 0 {
-				delete(i.bySPKI, r.SPKIHash)
+				delete(sh.bySPKI, r.SPKIHash)
 			}
 		}
 	}
 	if r.AgentId != "" {
-		if m := i.byAgent[r.AgentId]; m != nil {
+		if m := sh.byAgent[r.AgentId]; m != nil {
 			delete(m, r)
 			if len(m) == 0 {
-				delete(i.byAgent, r.AgentId)
+				delete(sh.byAgent, r.AgentId)
 			}
 		}
 	}
 	if r.PrincipalUid != "" {
-		if m := i.byUid[r.PrincipalUid]; m != nil {
+		if m := sh.byUid[r.PrincipalUid]; m != nil {
 			delete(m, r)
 			if len(m) == 0 {
-				delete(i.byUid, r.PrincipalUid)
+				delete(sh.byUid, r.PrincipalUid)
 			}
 		}
 	}
 	if r.CommonName != "" {
 		key := caCNKey{ca: r.CAName, cn: r.CommonName}
-		if m := i.byCAcn[key]; m != nil {
+		if m := sh.byCAcn[key]; m != nil {
 			delete(m, r)
 			if len(m) == 0 {
-				delete(i.byCAcn, key)
+				delete(sh.byCAcn, key)
 			}
 		}
 	}
+}
+
+// snapshotAll returns a copy of the full primary index (key -> record), used
+// by the convergence test to compare memory against the backend.
+func (i *CertIndex) snapshotAll() map[certKey]*db.CertRecord {
+	out := make(map[certKey]*db.CertRecord, i.Len())
+	for _, sh := range i.shards {
+		sh.mu.RLock()
+		for k, r := range sh.byKey {
+			out[k] = r
+		}
+		sh.mu.RUnlock()
+	}
+	return out
 }

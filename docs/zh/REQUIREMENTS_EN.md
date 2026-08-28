@@ -33,8 +33,10 @@ varwof-core's current data layer has the following structural contradictions (co
 | Sub-CA | `sub_cas` | Sub-CA status/protocol point lookups, CA relationship traversal |
 | Trust anchor | `trust_anchors` | Hot data for trust chain verification |
 | AIC extensions | `aic_extensions` | AIC queries by (ca,serial)/principal/agent |
+| Users | `rbac_users` | **Auth hot data (new 2026-08-27)**: full rows resident (username→credentials/role/CA scope/enabled + id index); credential checks, role/cascope resolution and token joins never hit SQL |
+| API tokens | `rbac_api_tokens` | **Auth hot data (new 2026-08-27)**: only SHA-256 hashes resident (never raw tokens); reads enforce expiry + owning user enabled in memory (mirrors `db.GetToken`'s JOIN+WHERE semantics) |
 
-> rbac_users / rbac_api_tokens / audit_log / audit_salts / acme_* / ra_* / webhook_subscriptions / key_escrow / ct_logs / gateway_registry / scep_requests / cross_certs / ca_meta and other **low-frequency tables remain pure SQL** (passed through via the underlying `db` package); they do not enter memory storage.
+> audit_log / audit_salts / acme_* / ra_* / webhook_subscriptions / key_escrow / ct_logs / gateway_registry / scep_requests / cross_certs / ca_meta and other **low-frequency tables remain pure SQL** (passed through via the underlying `db` package). **rbac_users / rbac_api_tokens are auth hot data as of 2026-08-27**: engine loads them in full at startup and reads are memory-is-truth (serve reads engine-first, DB-fallback); writes go through serve write-through (persist to DB first, then refresh the resident row).
 
 ### 2.2 Backend Persistence (write-through target)
 
@@ -110,7 +112,7 @@ All three dialects retained: SQLite (default, file + WAL) / PostgreSQL / MySQL. 
 - Concurrency safe: Consume must be an atomic CAS of "unused → used" semantics (concurrent double-spend: only one succeeds).
 - Background TTL cleanup (corresponding to `CleanupExpiredNonces`), batch-deleting backend `renewal_tokens`.
 - Note: MySQL `VARBINARY(16)` / PG `BYTEA` / SQLite `BLOB` nonce primary-key dialect differences are handled by the underlying db package.
-- **DA nonce (32B, `da_nonces`) anti-replay requires persist-before-confirm**: with WAL enabled, nonces are synchronously fsynced to WAL (`AddDANonceSync`) and batch-converged to the backend (`BulkStoreDANonces`); without WAL, synchronous DB writes. See `docs/RISKS.md` R1/R2.
+- **DA nonce (32B, `da_nonces`) anti-replay requires persist-before-confirm**: with WAL enabled, nonces are synchronously fsynced to WAL (`AddDANonceSync`) and batch-converged to the backend (`BulkStoreDANonces`); without WAL, they buffer through the batch write pipeline (`AddDANonce`) and converge on the next bulk flush (memory is authoritative for replay checks; unflushed nonces are not crash-safe on WAL-less backends by design). See `docs/RISKS.md` R1/R2.
 
 **FR-5 Sub-CA / Trust Anchor / AIC**
 - `SubCAIndex`: `(name)` → SubCA record + `parent_ca` reverse index.

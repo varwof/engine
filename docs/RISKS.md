@@ -120,6 +120,101 @@ Missing: issuance/revocation rate, eviction breakdown, AIC index size, resident 
 4. ~~R6 + R9 — query pagination + AIC janitor cleanup~~ ✅ (2026-08-20)
 5. ~~R8 + R10 — memory budget + metrics~~ ✅ (2026-08-20)
 
+## 🟡 R11 — RBAC user/Token index consistency wedge (2026-08-27)
+
+Authentication read paths (authByToken / authByBasic / authFromAIC / gateway
+delegation) and user/Token management writes all go through the serve wrapper
+methods (engine-first, DB-fallback; write-through = persist to DB first, then
+refresh/remove the resident row). Two accepted wedges remain:
+
+1. **OOB-create invisibility**: a user/Token created directly in the DB
+   (CLI / second instance, bypassing serve) is not resident → that account's
+   authentication falls back to the DB (still usable, no feature loss), but does
+   not enjoy the memory fast path until the next full restart load.
+2. **OOB-delete residue (mirror image of certs)**: a user/Token deleted in the
+   DB but still resident keeps authenticating from memory (memory-is-truth) —
+   the opposite direction of the cert out-of-band "read falls back and sees DB
+   writes". Mitigation: in-tree delete/update/password-rotation all go through
+   write-through, keeping memory and backend in step; pure-DB deletions require
+   a restart or routing the op through the wrapper.
+
+**Status: 🟡 Accepted trade-off (2026-08-27)** — consistent with the R2
+no-WAL stance (memory is authoritative; out-of-band operations degrade to DB
+round-trips / restart convergence). Documented in `docs/REQUIREMENTS.md` and the
+serve wrapper method comments.
+
+## 🔴 R12 — Write pipeline blocks forever on a half-open backend connection (2026-08-27)
+
+**Location:** `db/batch.go` / `db/da_nonces.go` / `recordbuffer/record_buffer.go`
+
+When a MySQL connection goes half-open (peer dead/reset), the inner
+`bulkInsertChunk→Exec→mysqlConn.readPacket` blocks **forever with no read
+deadline** while the flush holds `flushMu` for the whole pass: the drain
+goroutine wedges → pending is pinned at maxPending (every request 503) →
+`Stop()→FlushAll()` deadlocks on the same lock → graceful shutdown hangs. The
+previously documented "MySQL+engine write pipeline collapse: 21GB memory +
+connection reset by peer" is this failure family (the 21GB part was proven via
+dmesg to be an OOM kill: `oom-kill bench-smoke anon-rss ~21GB`; the current
+build is bounded by the 2GiB `MaxResidentBytes` budget and no longer reproduces it).
+
+**Fix:**
+1. `db/db.go`: the mysql branch of `OpenWithDialect` now injects
+   `ensureMySQLTimeouts` (adds `timeout=10s&readTimeout=30s&writeTimeout=30s`
+   only when absent; skips `@unix(` DSNs); new `ExecContext` (context-aware
+   rebind+adapt batch Exec).
+2. `db/batch.go` / `db/da_nonces.go`: new `BulkInsertCertRecordsCtx` /
+   `BulkStoreDANoncesCtx` plus chunk-level ctx variants; the legacy entries
+   delegate to `context.Background()`.
+3. `recordbuffer/record_buffer.go`: `flushLocked` / `replayWAL` bulk writes are
+   wrapped in `context.WithTimeout(..., flushDBTimeout=2min)` — a half-open
+   connection now returns an error after at most 2 minutes and the pass retries
+   instead of blocking indefinitely.
+
+**Status: ✅ FIXED (2026-08-27)** — also raised the PG/MySQL bulk chunk from
+39 rows to 500 rows per statement (`certChunkSize`; SQLite keeps the 999-variable
+bound), cutting write round-trips ~13× and lifting MySQL AIC @100ms from 4,325 to
+**6,034 certs/s**. Real-DB verification: MySQL regular @100ms (original crash
+scenario) 7,575 certs/s, AIC @100ms 6,034 certs/s, AIC @600ms 4,114/s — all
+exit=0 with a full report; PG AIC @600ms 4,054/s (no regression). `-race` green.
+New unit tests: `TestEnsureMySQLTimeouts`, `TestBulkInsertCertRecordsCtxCancelled`,
+`TestBulkStoreDANoncesCtxCancelled`.
+
 Status of each fix is tracked in `docs/NEXT_STEPS.md` and `docs/zh/NEXT_STEPS.md`.
 
 > **Real-DB verification complete** (2026-08-20): `BulkStoreDANonces` / `BulkRevokeCertificates` dialect branches verified against live PostgreSQL 15 and MariaDB 10.11 — new `TestPGBulkStoreDANonces` / `TestPGBulkRevokeCertificates` / `TestMySQLBulkStoreDANonces` / `TestMySQLBulkRevokeCertificates` (fresh per-run database, batch store + duplicate-ignore/idempotent re-run + 32-byte validation + per-row reasons across chunk boundaries). Full `go test -tags postgres` / `-tags mysql ./...` suites green.
+## 🔴 R13 — Full-buffer DA nonce store thundering-herds onto flushMu (2026-08-27)
+
+**Location:** `recordbuffer/record_buffer.go` (`AddDANonce` / `AddDANonceSync`)
+
+When the record buffer reaches `maxPending`, `AddDANonce` performed a
+synchronous `FlushAll()` on every request. `FlushAll` holds `flushMu` for the
+entire pass (a bulk insert of **all** pending records, O(backlog)), so once the
+buffer filled — sustained AIC load fills it at ~18s with the default 20k
+pending — every request goroutine serialized behind the same `flushMu`: the
+whole server froze with pending pinned at maxPending. Under the engine bench
+this surfaced as a hard throughput collapse: the 40s AIC @100ms run plateaued at
+~108k successes (identical to the 20s run) with p99 growing to ~22s and ~2,000
+goroutines blocked in `FlushAll`, while the drain goroutine was still mid-flush
+of an 85k-record batch.
+
+**Fix:** the synchronous append paths no longer flush themselves. When full,
+`waitForCapacity()` signals the drain loop and sleeps on a close-and-replace
+broadcast channel (`capacitySignal`) that the drain fires on every flush pass;
+all waiters wake at once the moment capacity frees. If the drain cannot free
+capacity within `fullWaitTimeout` (5s), `AddDANonce` returns the new
+`recordbuffer.ErrBackpressure`, which `Engine.StoreDANonce` normalizes onto
+`engine.ErrBackpressure` so the serve caller responds 503 (issuance fails, no
+certificate is minted, replay protection is never weakened). This is genuine
+backpressure — a full buffer means the backend cannot absorb writes — degraded
+gracefully instead of a server-wide deadlock.
+
+**Status: ✅ FIXED (2026-08-27)** — 40s AIC @100ms (MySQL, engine, 2500 agents)
+restored from the ~108k plateau to **~163k successes (~4.1k certs/s)**, which is
+exactly the sustained MySQL bulk-insert ceiling (~8k records/s incl. DA nonces,
+measured: 500-row chunks ≈ 7.3k certs/s standalone); no goroutines block in
+`FlushAll` anymore; backpressure surfaces as clean 503s. 20s runs burst to
+~5.3k certs/s above the ceiling (buffer absorbs), settling to ~4k/s sustained.
+New unit tests: `TestRecordBufferAddDANonceWaitsForCapacity`,
+`TestRecordBufferAddDANonceConcurrentWaits`,
+`TestRecordBufferAddDANonceBackpressureTimeout`. `-race` green across
+`recordbuffer/`/`engine/`/`db/`.

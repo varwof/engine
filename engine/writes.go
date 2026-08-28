@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/varwof/engine/db"
+	"github.com/varwof/engine/recordbuffer"
 )
 
 // IssueCert writes a certificate to memory first (immediately visible to all
@@ -246,20 +247,34 @@ func (e *Engine) ConsumeNonce(nonce []byte) error {
 }
 
 // StoreDANonce records a DelegationAuthorization nonce (SIZE(32)) for replay
-// protection. Memory is authoritative; the backend da_nonces table converges
-// through the batch write pipeline. Returns db.ErrDuplicateNonce if the nonce
-// was already used to mint an AIC (replay attempt).
+// protection, valid until exp. Memory is authoritative; the backend da_nonces
+// table converges through the batch write pipeline. Returns
+// db.ErrDuplicateNonce if the nonce was already used to mint an AIC (replay
+// attempt).
+//
+// exp is the retention deadline derived by the caller from the DA's timestamp /
+// lifetime and the server's timestamp-skew window (+ a clock-skew buffer). The
+// nonce only needs to outlive the window during which a replayed DA could pass
+// the freshness check; after that a replayed DA is rejected as stale without
+// needing the nonce. Passing a short exp keeps the in-memory set small (a
+// 3-minute window at 5k/s ≈ 1M entries vs the previous flat 24h TTL ≈ hundreds
+// of millions).
 //
 // Crash safety: with WAL enabled, the nonce is WAL-fsynced before this returns,
 // so once the caller's AIC issuance is acknowledged the nonce survives a crash
-// and a replayed DA signature is rejected. Without WAL (non-file backend) the
-// nonce is persisted synchronously to the DB instead.
-func (e *Engine) StoreDANonce(nonce []byte) error {
+// and a replayed DA signature is rejected. Without WAL (non-file backend such
+// as PostgreSQL/MySQL) the nonce is buffered through the same batch pipeline
+// as certificates and converges on the next bulk flush — a crash before that
+// flush can drop unpersisted nonces, so a replayed DA signature may be accepted
+// until the DB converges again. This trades a synchronous single-row INSERT per
+// request (the AIC per-request throughput wall) for batch persistence, matching
+// the memory-is-truth model of the rest of the engine.
+func (e *Engine) StoreDANonce(nonce []byte, exp time.Time) error {
 	if len(nonce) != 32 {
 		return fmt.Errorf("store_da_nonce: nonce must be 32 bytes, got %d", len(nonce))
 	}
 	// Reserve in memory first (atomic; concurrent duplicate claims lose).
-	if err := e.daNonces.store(nonce, time.Now().Add(e.opts.NonceTTL)); err != nil {
+	if err := e.daNonces.store(nonce, exp); err != nil {
 		if errors.Is(err, ErrBackpressure) {
 			e.opts.Logger.Warn("engine: da nonce store rejected by backpressure", "nonce", hex.EncodeToString(nonce))
 		}
@@ -268,17 +283,28 @@ func (e *Engine) StoreDANonce(nonce []byte) error {
 	if e.rb.WALEnabled() {
 		if err := e.rb.AddDANonceSync(nonce); err != nil {
 			e.daNonces.remove(nonce)
-			return fmt.Errorf("store_da_nonce: %w", err)
+			return storeDANonceErr(err)
 		}
 		return nil
 	}
-	// No WAL: persist synchronously so the nonce is durable before the
-	// issuance is acknowledged.
-	if err := e.DB().StoreDANonce(nonce); err != nil {
+	// No WAL: enqueue into the batch write pipeline instead of a synchronous
+	// per-nonce INSERT. Memory is authoritative for replay checks; the backend
+	// da_nonces table converges on the next bulk flush.
+	if err := e.rb.AddDANonce(nonce); err != nil {
 		e.daNonces.remove(nonce)
-		return err
+		return storeDANonceErr(err)
 	}
 	return nil
+}
+
+// storeDANonceErr normalizes record-buffer errors onto the engine's public
+// sentinel so callers can `errors.Is(err, ErrBackpressure)` regardless of which
+// append path failed.
+func storeDANonceErr(err error) error {
+	if errors.Is(err, recordbuffer.ErrBackpressure) {
+		return ErrBackpressure
+	}
+	return fmt.Errorf("store_da_nonce: %w", err)
 }
 
 // IsDANonceUsed reports whether a DelegationAuthorization nonce has already

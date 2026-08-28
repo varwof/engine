@@ -43,7 +43,7 @@ func TestStoreDANonceBatchConvergence(t *testing.T) {
 	for i := range nonces {
 		nonces[i] = make([]byte, 32)
 		nonces[i][0] = byte(i)
-		if err := e.StoreDANonce(nonces[i]); err != nil {
+		if err := e.StoreDANonce(nonces[i], futureExp()); err != nil {
 			t.Fatalf("StoreDANonce %d: %v", i, err)
 		}
 	}
@@ -82,10 +82,13 @@ func TestStoreDANonceBatchConvergence(t *testing.T) {
 	}
 }
 
-// TestStoreDANonceNoWALFallbackSync verifies the crash-safety fallback: without
-// a WAL, StoreDANonce persists synchronously to the DB before returning, so a
-// crash right after acknowledgment cannot lose the nonce.
-func TestStoreDANonceNoWALFallbackSync(t *testing.T) {
+// TestStoreDANonceNoWALBatchAndReplay verifies the WAL-less DA nonce path goes
+// through the batch write pipeline instead of a synchronous single-row INSERT:
+// the nonce is authoritative in memory immediately (replay rejected with no DB
+// round trip — the AIC throughput fix for PostgreSQL/MySQL) and converges to
+// the backend da_nonces table on FlushAll. Crash before that flush can drop
+// unpersisted nonces by design (documented tradeoff).
+func TestStoreDANonceNoWALBatchAndReplay(t *testing.T) {
 	e := newTestEngine(t) // newTestEngine opens with no WalPath
 
 	if e.rb.WALEnabled() {
@@ -96,17 +99,31 @@ func TestStoreDANonceNoWALFallbackSync(t *testing.T) {
 	if _, err := rand.Read(nonce); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.StoreDANonce(nonce); err != nil {
+	if err := e.StoreDANonce(nonce, futureExp()); err != nil {
 		t.Fatal(err)
 	}
 
-	// Synchronous: the DB must already have the nonce, no flush required.
+	// Memory-first: replay protection acts immediately, before any flush.
+	if used, _ := e.IsDANonceUsed(nonce); !used {
+		t.Fatal("DA nonce should be in memory immediately after store")
+	}
+	if err := e.StoreDANonce(nonce, futureExp()); !errors.Is(err, db.ErrDuplicateNonce) {
+		t.Fatalf("replay without flush: want db.ErrDuplicateNonce, got %v", err)
+	}
+
+	// Converges to the backend on FlushAll.
+	if err := e.FlushAll(); err != nil {
+		t.Fatalf("FlushAll: %v", err)
+	}
 	used, err := e.DB().IsDANonceUsed(nonce)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !used {
-		t.Fatal("DA nonce not synchronously persisted without WAL")
+		t.Fatal("DA nonce not persisted to backend after batch flush")
+	}
+	if err := e.StoreDANonce(nonce, futureExp()); !errors.Is(err, db.ErrDuplicateNonce) {
+		t.Fatalf("replay after flush: want db.ErrDuplicateNonce, got %v", err)
 	}
 }
 
@@ -160,7 +177,7 @@ func TestStoreDANonceWALCrashRecovery(t *testing.T) {
 	if !used {
 		t.Fatal("DA nonce lost across crash (replay protection broken)")
 	}
-	if err := e.StoreDANonce(make([]byte, 32)); !errors.Is(err, db.ErrDuplicateNonce) {
+	if err := e.StoreDANonce(make([]byte, 32), futureExp()); !errors.Is(err, db.ErrDuplicateNonce) {
 		t.Fatalf("replay after crash: want ErrDuplicateNonce, got %v", err)
 	}
 }
@@ -195,7 +212,7 @@ func daNonceCrashAndExit(t *testing.T) {
 	d.Close()
 	_ = e // never stopped: the hard exit below is the crash
 
-	if err := e.StoreDANonce(make([]byte, 32)); err != nil {
+	if err := e.StoreDANonce(make([]byte, 32), futureExp()); err != nil {
 		t.Fatal(err)
 	}
 	os.Exit(0)

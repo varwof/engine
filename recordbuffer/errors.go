@@ -15,3 +15,8 @@ var ErrWALLocked = errors.New("record buffer WAL locked by another process")
 // log (e.g. crash-safe DA nonce storage) is attempted on a buffer created
 // without a WAL path. Callers fall back to synchronous DB persistence.
 var ErrWALDisabled = errors.New("record buffer WAL disabled")
+
+// ErrBackpressure is returned when a synchronous append waits fullWaitTimeout
+// for the drain loop to free buffer capacity. Callers should respond 503 so the
+// client retries.
+var ErrBackpressure = errors.New("record buffer at capacity")
