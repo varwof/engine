@@ -657,6 +657,15 @@ func (rb *RecordBuffer) flushLocked() {
 	// (unless periodic fsync triggers), so truncating the file does not affect
 	// unflushed records: they are rewritten from offset 0 on the next flush.
 	// All WAL file/bufio ops take walMu (Add/AddDANonceSync too).
+	rb.truncateWALIfIdle()
+	slog.Debug("record_buffer: flushed", "n", n)
+}
+
+// truncateWALIfIdle truncates the WAL file to zero when no records are pending.
+// The check must be re-run by FlushAll even when flushLocked early-returns with
+// an empty buffer: the drain loop may have flushed the final batch while pending
+// was still non-zero, leaving a non-empty WAL after FlushAll.
+func (rb *RecordBuffer) truncateWALIfIdle() {
 	if rb.pending.Load() == 0 && rb.walFile != nil {
 		rb.walMu.Lock()
 		rb.walBuf.Flush()
@@ -664,7 +673,6 @@ func (rb *RecordBuffer) flushLocked() {
 		rb.walFile.Seek(0, io.SeekStart)
 		rb.walMu.Unlock()
 	}
-	slog.Debug("record_buffer: flushed", "n", n)
 }
 
 // FlushAll synchronously flushes all buffered records to the DB and fsyncs
@@ -675,6 +683,10 @@ func (rb *RecordBuffer) FlushAll() {
 	rb.flushMu.Lock()
 	defer rb.flushMu.Unlock()
 	rb.flushLocked()
+	// flushLocked early-returns when the in-memory buffer is already empty,
+	// which can leave a non-empty WAL behind; re-check the idle truncation so
+	// that pending == 0 always implies an empty WAL after FlushAll.
+	rb.truncateWALIfIdle()
 	if rb.walBuf != nil {
 		rb.walMu.Lock()
 		rb.walBuf.Flush()
