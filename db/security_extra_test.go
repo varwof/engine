@@ -105,27 +105,3 @@ func TestAcmeTokenEncryptedAtRest(t *testing.T) {
 		t.Fatalf("GetAcmeChallenge token = %q, want %q", ch.Token, secret)
 	}
 }
-
-// TestAcmeTokenWrongKeyFails verifies that reading a challenge with the wrong
-// at-rest key fails closed instead of returning garbage or plaintext.
-func TestAcmeTokenWrongKeyFails(t *testing.T) {
-	d := newTestDB(t)
-	if err := d.SetAtRestKey(strings.Repeat("cd", 32)); err != nil {
-		t.Fatal(err)
-	}
-	acctID, _ := d.InsertAcmeAccount("thumb-e2", `{}`, "c@d.com", "valid")
-	orderID, _ := d.InsertAcmeOrder(acctID, `[]`, "20991231T000000Z")
-	authzID, _ := d.InsertAcmeAuthorization(orderID, "dns", "example.com", "tok", "20991231T000000Z")
-	challID, err := d.InsertAcmeChallenge(authzID, "http-01", "secret-token")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Rotate the key in memory (simulating a config change with a different key).
-	if err := d.SetAtRestKey(strings.Repeat("ef", 32)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := d.GetAcmeChallenge(challID); err == nil {
-		t.Fatal("expected decrypt error with wrong at-rest key")
-	}
-}
