@@ -136,10 +136,14 @@ func (d *DB) UpdateAcmeOrderFinalize(id int64, status string) error {
 }
 
 func (d *DB) InsertAcmeAuthorization(orderID int64, idType, idValue, token, expires string) (int64, error) {
+	encToken, err := encryptAtRest(d.secretKey, token)
+	if err != nil {
+		return 0, fmt.Errorf("encrypt acme authz token: %w", err)
+	}
 	id, err := d.InsertReturning(`
 		INSERT INTO acme_authorizations (order_id, identifier_type, identifier_value, status, token, expires, created_at)
 		VALUES (?, ?, ?, 'pending', ?, ?, ?)`,
-		orderID, idType, idValue, token, expires, time.Now().UTC().Format(time.RFC3339))
+		orderID, idType, idValue, encToken, expires, time.Now().UTC().Format(time.RFC3339))
 	if err != nil {
 		return 0, fmt.Errorf("insert acme authz: %w", err)
 	}
@@ -150,7 +154,18 @@ func (d *DB) GetAcmeAuthorization(id int64) (*AcmeAuthorization, error) {
 	row := d.QueryRow(`
 		SELECT id, order_id, identifier_type, identifier_value, status, token, expires, created_at
 		FROM acme_authorizations WHERE id = ?`, id)
-	return scanAcmeAuthorization(row)
+	a, err := scanAcmeAuthorization(row)
+	if err != nil {
+		return nil, err
+	}
+	if a != nil {
+		plain, derr := decryptAtRest(d.secretKey, a.Token)
+		if derr != nil {
+			return nil, derr
+		}
+		a.Token = plain
+	}
+	return a, nil
 }
 
 func (d *DB) GetAcmeAuthorizationsByOrder(orderID int64) ([]*AcmeAuthorization, error) {
@@ -168,6 +183,11 @@ func (d *DB) GetAcmeAuthorizationsByOrder(orderID int64) ([]*AcmeAuthorization, 
 		if err != nil {
 			return nil, err
 		}
+		plain, err := decryptAtRest(d.secretKey, a.Token)
+		if err != nil {
+			return nil, err
+		}
+		a.Token = plain
 		result = append(result, a)
 	}
 	return result, rows.Err()
@@ -182,10 +202,14 @@ func (d *DB) UpdateAcmeAuthzStatus(id int64, status string) error {
 }
 
 func (d *DB) InsertAcmeChallenge(authzID int64, challType, token string) (int64, error) {
+	encToken, err := encryptAtRest(d.secretKey, token)
+	if err != nil {
+		return 0, fmt.Errorf("encrypt acme challenge token: %w", err)
+	}
 	id, err := d.InsertReturning(`
 		INSERT INTO acme_challenges (authz_id, type, token, status)
 		VALUES (?, ?, ?, 'pending')`,
-		authzID, challType, token)
+		authzID, challType, encToken)
 	if err != nil {
 		return 0, fmt.Errorf("insert acme challenge: %w", err)
 	}
@@ -196,7 +220,18 @@ func (d *DB) GetAcmeChallenge(id int64) (*AcmeChallenge, error) {
 	row := d.QueryRow(`
 		SELECT id, authz_id, type, token, status, validated_at
 		FROM acme_challenges WHERE id = ?`, id)
-	return scanAcmeChallenge(row)
+	c, err := scanAcmeChallenge(row)
+	if err != nil {
+		return nil, err
+	}
+	if c != nil {
+		plain, derr := decryptAtRest(d.secretKey, c.Token)
+		if derr != nil {
+			return nil, derr
+		}
+		c.Token = plain
+	}
+	return c, nil
 }
 
 func (d *DB) GetAcmeChallengesByAuthz(authzID int64) ([]*AcmeChallenge, error) {
@@ -214,6 +249,11 @@ func (d *DB) GetAcmeChallengesByAuthz(authzID int64) ([]*AcmeChallenge, error) {
 		if err != nil {
 			return nil, err
 		}
+		plain, err := decryptAtRest(d.secretKey, c.Token)
+		if err != nil {
+			return nil, err
+		}
+		c.Token = plain
 		result = append(result, c)
 	}
 	return result, rows.Err()

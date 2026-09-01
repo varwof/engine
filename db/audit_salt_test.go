@@ -88,7 +88,7 @@ func TestLogAuditMasking(t *testing.T) {
 		t.Fatalf("remote_addr should be a 64-hex HMAC digest, got %q", e.RemoteAddr)
 	}
 	// Chain still verifies with the masked value.
-	expected := HashAuditEntry("", e.Timestamp, e.Username, e.Action, e.Detail)
+	expected := HashAuditEntry("", e.Timestamp, e.Username, e.RemoteAddr, e.Method, e.Path, e.Action, e.Detail)
 	if e.EntryHash != expected {
 		t.Fatalf("chain hash mismatch: got %q want %q", e.EntryHash, expected)
 	}

@@ -42,9 +42,11 @@ type fileLockHandle struct {
 func newFileLock(d *DB) DistLock {
 	dir := lockDirForDB(d)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		// If we cannot prepare a lock directory, degrade to noop rather than
-		// crashing startup. Coordination is best-effort.
-		return noopLock{}
+		// Fail closed: surface the coordination failure to the caller instead
+		// of silently succeeding with a noop. A lock that always succeeds while
+		// providing no mutual exclusion enables duplicate serials / torn schema
+		// (finding 13).
+		return &failClosedLock{err: fmt.Errorf("create lock dir %q: %w", dir, err)}
 	}
 	return &fileLock{dir: dir, held: make(map[int64]*fileLockHandle)}
 }
@@ -85,9 +87,24 @@ func (l *fileLock) acquire(key int64, block bool) (bool, error) {
 	}
 	l.mu.Unlock()
 
-	f, err := os.OpenFile(l.lockPath(key), os.O_CREATE|os.O_RDWR, 0o600)
+	// Open with O_NOFOLLOW so a pre-placed or swapped-in symlink at the lock
+	// path cannot redirect us to an arbitrary inode (TOCTOU/symlink attack).
+	// O_CLOEXEC keeps the descriptor out of any exec'd child.
+	f, err := os.OpenFile(l.lockPath(key), os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
 	if err != nil {
-		return false, fmt.Errorf("open lock file: %w", err)
+		return false, fmt.Errorf("open lock file (no-follow): %w", err)
+	}
+
+	// Re-validate right before flock: the descriptor must still reference the
+	// same non-symlink regular file we opened, closing the open→flock window.
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return false, fmt.Errorf("stat lock file: %w", err)
+	}
+	if !st.Mode().IsRegular() {
+		f.Close()
+		return false, fmt.Errorf("lock path %q is not a regular file", l.lockPath(key))
 	}
 
 	var op int

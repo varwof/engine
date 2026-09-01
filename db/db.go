@@ -11,6 +11,7 @@ import (
 	"crypto/sha1"
 	"crypto/x509"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -30,6 +31,25 @@ type DB struct {
 	// directory for non-PostgreSQL dialects (see NewDistLock). Empty for
 	// network databases where it is not applicable.
 	path string
+	// secretKey is the AES-256 key used to encrypt short-lived capability
+	// secrets (ACME tokens) at rest. It must be supplied from outside the
+	// database (env / KMS). When nil, ACME tokens are stored as before.
+	secretKey []byte
+}
+
+// SetAtRestKey configures the AES-256 key used to encrypt ACME tokens at rest.
+// keyHex must be 64 hex chars (32 bytes). It is stored only in process memory,
+// never written to the database.
+func (d *DB) SetAtRestKey(keyHex string) error {
+	if len(keyHex) != 64 {
+		return fmt.Errorf("at-rest key must be 64 hex chars (32 bytes), got %d", len(keyHex))
+	}
+	key, err := hex.DecodeString(keyHex)
+	if err != nil {
+		return fmt.Errorf("at-rest key is not valid hex: %w", err)
+	}
+	d.secretKey = key
+	return nil
 }
 
 func (d *DB) Dialect() Dialect { return d.dialect }
@@ -190,7 +210,7 @@ func OpenWithDialect(dsn string, d Dialect) (*DB, error) {
 		}
 	}
 
-	result := &DB{db, d, dsn}
+	result := &DB{DB: db, dialect: d, path: dsn}
 	if err := result.migrate(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
@@ -537,10 +557,25 @@ func (d *DB) InsertReturning(query string, args ...interface{}) (int64, error) {
 }
 
 // LikeExpr returns a LIKE expression with substring match on both sides.
-// Uses || concatenation for SQLite/PG and CONCAT for MySQL.
+// Uses || concatenation for SQLite/PG and CONCAT for MySQL. The ESCAPE clause
+// ensures user-supplied % and _ in the search term are treated as literals,
+// not wildcards (prevents broad-result enumeration via wildcard injection).
 func (d *DB) LikeExpr(col string) string {
 	if d.dialect.DriverName() == "mysql" {
-		return col + " LIKE CONCAT('%', ?, '%')"
+		return col + " LIKE CONCAT('%', ?, '%') ESCAPE '\\\\'"
 	}
-	return col + " LIKE '%' || ? || '%'"
+	return col + " LIKE '%' || ? || '%' ESCAPE '\\'"
+}
+
+// EscapeLike escapes LIKE wildcard characters in user-supplied search terms
+// so they match literally instead of broadening the result set. Must be used
+// together with LikeExpr (or any bare LIKE '%...%') to be effective.
+func EscapeLike(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
+}
+
+// LikeSearch escapes a user-supplied search term for use with LikeExpr.
+func (d *DB) LikeSearch(term string) string {
+	return EscapeLike(term)
 }

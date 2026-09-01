@@ -65,7 +65,11 @@ func (SQLiteDialect) DSN() string        { return "" }
 // causing throughput to drop sharply as the database grows). SQLite PRAGMA
 // parameters are embedded as multiple ?_pragma= groups connected by &.
 func (SQLiteDialect) OpenSuffix() string {
-	return "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-65536)"
+	// _pragma=foreign_keys(1) is applied by the driver on EVERY new connection,
+	// so referential integrity is enforced on all pooled connections — not just
+	// the single connection that runs the db.Exec(SQLiteDialect.EnableFKs()) in
+	// OpenWithDialect. (SQLite foreign_keys is a per-connection setting.)
+	return "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-65536)&_pragma=foreign_keys(1)"
 }
 func (SQLiteDialect) AutoIncrement() string    { return "INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT" }
 func (SQLiteDialect) BlobType() string         { return "BLOB" }
@@ -158,7 +162,12 @@ func (mysqlDialect) AutoIncrement() string    { return "INTEGER NOT NULL PRIMARY
 func (mysqlDialect) BlobType() string         { return "BLOB" }
 func (mysqlDialect) NowExpr() string          { return "NOW()" }
 func (mysqlDialect) Placeholder(i int) string { return "?" }
-func (mysqlDialect) EnableFKs() string        { return "" } // MySQL parses but ignores FK by default
+
+// MySQL enforces foreign keys by default (FOREIGN_KEY_CHECKS defaults to 1), so
+// no per-session PRAGMA is needed; returning "" is correct. If an operator
+// disables FOREIGN_KEY_CHECKS globally it is applied to every connection by the
+// server, which no DSN parameter can override per-connection.
+func (mysqlDialect) EnableFKs() string        { return "" }
 func (mysqlDialect) SupportsColumnDrop() bool { return true }
 
 func (mysqlDialect) InsertOrReplace(table, columns, values string) string {

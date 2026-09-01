@@ -537,28 +537,27 @@ func (rb *RecordBuffer) AddDANonceSync(nonce []byte) error {
 		return err
 	}
 
-	rb.mu.Lock()
-	rb.records = append(rb.records, DANonceItem(nonce))
-	rb.mu.Unlock()
-	rb.pending.Add(1)
-
-	// Append to the WAL and sync it before returning, all under walMu so this
-	// never overlaps the drain goroutine's flushLocked or another writer on the
-	// same bufio/file. On failure, roll back the in-memory entry so the
-	// caller's engine can drop its memory reservation.
+	// Durability-first: write and fsync the WAL line BEFORE publishing the
+	// nonce to memory. If the fsync fails there is nothing to roll back, so a
+	// concurrent add() can never have its (last) record wrongly popped (finding
+	// 3). Holding walMu across the fsync and the pending increment also keeps
+	// truncateWALIfIdle — which re-checks pending under walMu — from cutting a
+	// just-written line (finding 21).
 	rb.walMu.Lock()
 	rb.walBuf.Write(line)
 	rb.walBuf.WriteByte('\n')
 	if err := rb.walBuf.Flush(); err != nil {
 		rb.walMu.Unlock()
-		rb.rollbackLast()
 		return err
 	}
 	if err := rb.walFile.Sync(); err != nil {
 		rb.walMu.Unlock()
-		rb.rollbackLast()
 		return err
 	}
+	rb.pending.Add(1)
+	rb.mu.Lock()
+	rb.records = append(rb.records, DANonceItem(nonce))
+	rb.mu.Unlock()
 	rb.walMu.Unlock()
 
 	// Signal the drain loop so the batch converges to the DB promptly.
@@ -569,31 +568,21 @@ func (rb *RecordBuffer) AddDANonceSync(nonce []byte) error {
 	return nil
 }
 
-// rollbackLast removes the most recently appended item (used when a
-// synchronous WAL fsync fails).
-func (rb *RecordBuffer) rollbackLast() {
-	rb.mu.Lock()
-	if len(rb.records) > 0 {
-		rb.records = rb.records[:len(rb.records)-1]
-	}
-	rb.mu.Unlock()
-	rb.pending.Add(-1)
-	rb.capacity.signal()
-}
-
-func (rb *RecordBuffer) flush() {
+func (rb *RecordBuffer) flush() error {
 	rb.flushMu.Lock()
 	defer rb.flushMu.Unlock()
-	rb.flushLocked()
+	return rb.flushLocked()
 }
 
-// flushLocked performs one flush pass. Callers must hold flushMu.
-func (rb *RecordBuffer) flushLocked() {
+// flushLocked performs one flush pass. Callers must hold flushMu. The returned
+// error (a failed backend bulk write) leaves the buffered records in place so a
+// later pass can retry them; the caller decides how to surface it.
+func (rb *RecordBuffer) flushLocked() error {
 	flushStart := time.Now()
 	rb.mu.Lock()
 	if len(rb.records) == 0 {
 		rb.mu.Unlock()
-		return
+		return nil
 	}
 	n := len(rb.records)
 	batch := make([]Item, n)
@@ -602,7 +591,7 @@ func (rb *RecordBuffer) flushLocked() {
 
 	d := rb.db()
 	if d == nil {
-		return
+		return fmt.Errorf("record_buffer: no database handle")
 	}
 
 	// Split the snapshot into per-kind groups; each group persists in one
@@ -633,7 +622,7 @@ func (rb *RecordBuffer) flushLocked() {
 	}
 	if err != nil {
 		slog.Warn("record_buffer: bulk write failed", "n", len(batch), "error", err)
-		return
+		return err
 	}
 	if dur := time.Since(flushStart); dur > 50*time.Millisecond {
 		slog.Info("record_buffer: slow flush", "n", n, "dur_ms", dur.Milliseconds(), "pending", rb.pending.Load())
@@ -659,6 +648,7 @@ func (rb *RecordBuffer) flushLocked() {
 	// All WAL file/bufio ops take walMu (Add/AddDANonceSync too).
 	rb.truncateWALIfIdle()
 	slog.Debug("record_buffer: flushed", "n", n)
+	return nil
 }
 
 // truncateWALIfIdle truncates the WAL file to zero when no records are pending.
@@ -666,23 +656,34 @@ func (rb *RecordBuffer) flushLocked() {
 // an empty buffer: the drain loop may have flushed the final batch while pending
 // was still non-zero, leaving a non-empty WAL after FlushAll.
 func (rb *RecordBuffer) truncateWALIfIdle() {
-	if rb.pending.Load() == 0 && rb.walFile != nil {
-		rb.walMu.Lock()
+	if rb.walFile == nil {
+		return
+	}
+	// Re-check pending while holding walMu. The pending increment and the WAL
+	// line write in add()/AddDANonceSync() both complete before walMu is
+	// released, so a non-zero pending here means a live, unflushed line is
+	// present and must not be cut (finding 21).
+	rb.walMu.Lock()
+	if rb.pending.Load() == 0 {
 		rb.walBuf.Flush()
 		rb.walFile.Truncate(0)
 		rb.walFile.Seek(0, io.SeekStart)
-		rb.walMu.Unlock()
 	}
+	rb.walMu.Unlock()
 }
 
 // FlushAll synchronously flushes all buffered records to the DB and fsyncs
 // the WAL. Used before read-modify-write operations (e.g. revocation) so
 // that recently issued-but-unflushed certificates are visible to the DB,
 // avoiding the ≤500ms visibility window between issue and bulk insert.
-func (rb *RecordBuffer) FlushAll() {
+// It returns an error when the backend write fails so callers can surface a
+// durability-critical transition that did not land (findings 1/4).
+func (rb *RecordBuffer) FlushAll() error {
 	rb.flushMu.Lock()
 	defer rb.flushMu.Unlock()
-	rb.flushLocked()
+	if err := rb.flushLocked(); err != nil {
+		return err
+	}
 	// flushLocked early-returns when the in-memory buffer is already empty,
 	// which can leave a non-empty WAL behind; re-check the idle truncation so
 	// that pending == 0 always implies an empty WAL after FlushAll.
@@ -693,6 +694,7 @@ func (rb *RecordBuffer) FlushAll() {
 		rb.walFile.Sync()
 		rb.walMu.Unlock()
 	}
+	return nil
 }
 
 func (rb *RecordBuffer) run(ctx context.Context) {
@@ -719,7 +721,7 @@ func (rb *RecordBuffer) run(ctx context.Context) {
 				}
 			}
 		case <-ctx.Done():
-			rb.FlushAll()
+			_ = rb.FlushAll()
 			if rb.walFile != nil {
 				rb.walMu.Lock()
 				rb.walFile.Close()
@@ -738,7 +740,11 @@ func (rb *RecordBuffer) run(ctx context.Context) {
 // Continuous draining eliminates this rate limit.
 func (rb *RecordBuffer) drain() {
 	for {
-		rb.flush()
+		if err := rb.flush(); err != nil {
+			// A failed bulk write leaves the records in place; the flushTicker
+			// and flushCh signals retry them on the next pass.
+			return
+		}
 		if rb.pending.Load() < int32(rb.threshold) {
 			return
 		}

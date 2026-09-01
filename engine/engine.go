@@ -87,6 +87,20 @@ type Engine struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 
+	// sendMu serializes op submission against shutdown. Producers hold the read
+	// lock while blocking-sending to a writer shard; Stop takes the write lock
+	// only after the writer goroutines have drained and exited. A send is
+	// therefore guaranteed to reach a live writer until shutdown completes, so
+	// no security-critical op is dropped (finding 5). After Stop marks the
+	// engine stopped, new ops run inline rather than being lost.
+	sendMu sync.RWMutex
+	// stopped is true once the writer goroutines have drained and exited; ops
+	// submitted after this point execute inline on the caller's goroutine.
+	stopped atomic.Bool
+	// reconcileSince is the watermark for periodic out-of-band revocation
+	// reconciliation. Written and read only by the janitor goroutine.
+	reconcileSince time.Time
+
 	evictions    atomic.Uint64
 	readHits     atomic.Uint64
 	readMiss     atomic.Uint64
@@ -110,19 +124,20 @@ func NewEngine(d *db.DB, opts EngineOptions) (*Engine, error) {
 	}
 
 	e := &Engine{
-		opts:         opts,
-		certIdx:      NewCertIndex(),
-		revoked:      NewRevokedSet(opts.MaxRevoked),
-		nonces:       NewNonceSet(opts.MaxNonces),
-		daNonces:     NewNonceSet(opts.MaxDANonces),
-		subCas:       NewSubCAIndex(),
-		trust:        NewTrustIndex(),
-		aic:          NewAICIndex(),
-		users:        newUserIndex(),
-		tokens:       newTokenIndex(),
-		writerShards: shards,
-		ctx:          ctx,
-		cancel:       cancel,
+		opts:           opts,
+		certIdx:        NewCertIndex(),
+		revoked:        NewRevokedSet(opts.MaxRevoked),
+		nonces:         NewNonceSet(opts.MaxNonces),
+		daNonces:       NewNonceSet(opts.MaxDANonces),
+		subCas:         NewSubCAIndex(),
+		trust:          NewTrustIndex(),
+		aic:            NewAICIndex(),
+		users:          newUserIndex(),
+		tokens:         newTokenIndex(),
+		writerShards:   shards,
+		ctx:            ctx,
+		cancel:         cancel,
+		reconcileSince: time.Now(),
 	}
 	e.db.Store(d)
 
@@ -190,16 +205,21 @@ func (e *Engine) Start() {
 // reads/writes need not call it because memory is authoritative and revocation
 // already flushes internally.
 func (e *Engine) FlushAll() error {
-	e.rb.FlushAll()
+	if err := e.rb.FlushAll(); err != nil {
+		return err
+	}
 	n := len(e.writerShards)
 	barriers := make([]chan struct{}, n)
 	for i, ch := range e.writerShards {
 		barriers[i] = make(chan struct{})
-		select {
-		case ch <- func() error { close(barriers[i]); return nil }:
-		case <-e.ctx.Done():
-			return e.ctx.Err()
+		e.sendMu.RLock()
+		if e.stopped.Load() {
+			e.sendMu.RUnlock()
+			close(barriers[i])
+			continue
 		}
+		ch <- func() error { close(barriers[i]); return nil }
+		e.sendMu.RUnlock()
 	}
 	for i := range barriers {
 		select {
@@ -211,12 +231,18 @@ func (e *Engine) FlushAll() error {
 	return nil
 }
 
-// Stop flushes all pending work and shuts down background goroutines.
+// Stop flushes all pending work and shuts down background goroutines. Writer
+// goroutines drain their queues before exiting, and the engine marks itself
+// stopped only after that drain completes, so an op submitted concurrently
+// with Stop is executed rather than dropped (finding 5).
 func (e *Engine) Stop() {
 	// Push buffered certs to the DB first so queued revoke UPDATEs match.
-	e.rb.FlushAll()
+	_ = e.rb.FlushAll()
 	e.cancel()
 	e.wg.Wait()
+	e.sendMu.Lock()
+	e.stopped.Store(true)
+	e.sendMu.Unlock()
 	e.rb.Stop()
 }
 
@@ -224,12 +250,82 @@ func (e *Engine) Stop() {
 // ops are serialized in order; a zero key routes to shard 0. Same-key ordering
 // is what preserves nonce Store→Consume and cert issue→revoke semantics under
 // sharded parallelism.
+//
+// The op is never dropped: the blocking send is guaranteed to reach a live
+// writer until Stop has drained and shut down the shards; after that the op
+// runs inline (finding 5).
 func (e *Engine) enqueue(key string, f func() error) {
-	shard := e.writerShards[e.writerShardForKey(key)]
-	select {
-	case shard <- f:
-	case <-e.ctx.Done():
+	e.sendMu.RLock()
+	defer e.sendMu.RUnlock()
+	if e.stopped.Load() {
+		if err := f(); err != nil {
+			e.opts.Logger.Warn("engine: backend write failed during shutdown", "error", err)
+		}
+		return
 	}
+	e.writerShards[e.writerShardForKey(key)] <- f
+}
+
+// enqueueSync submits an op to the backend writer shard that owns key and
+// waits for it to run, returning its error. It is the durable variant of
+// enqueue for security-critical transitions (revocation, nonce consumption /
+// insertion): a persistence failure is returned to the caller instead of being
+// swallowed, and the op is never dropped on shutdown (findings 1/4/5).
+func (e *Engine) enqueueSync(key string, f func() error) error {
+	e.sendMu.RLock()
+	if e.stopped.Load() {
+		e.sendMu.RUnlock()
+		return f()
+	}
+	ch := e.writerShards[e.writerShardForKey(key)]
+	done := make(chan error, 1)
+	wrapped := func() error {
+		err := f()
+		done <- err
+		return err
+	}
+	ch <- wrapped
+	e.sendMu.RUnlock()
+	// The writer runs wrapped during normal operation or the shutdown drain, so
+	// done always receives a value before the writer for that shard exits.
+	return <-done
+}
+
+// persistDurable runs a durability-critical backend op synchronously through
+// the writer pipeline, retrying transient failures with a short backoff. It
+// returns the op's error so callers surface a revocation that did not reach
+// the backend instead of acknowledging it in memory only (findings 1/4).
+func (e *Engine) persistDurable(key string, op func() error) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err = e.enqueueSync(key, op); err == nil {
+			return nil
+		}
+		select {
+		case <-e.ctx.Done():
+			return err
+		case <-time.After(time.Duration(attempt+1) * 50 * time.Millisecond):
+		}
+	}
+	return err
+}
+
+// flushDurable synchronously drains the record buffer, retrying transient
+// backend failures, so a caller's dependent write (e.g. a revocation UPDATE)
+// can rely on the preceding certificate INSERTs having landed.
+func (e *Engine) flushDurable() error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err = e.rb.FlushAll(); err == nil {
+			return nil
+		}
+		select {
+		case <-e.ctx.Done():
+			return err
+		case <-time.After(time.Duration(attempt+1) * 50 * time.Millisecond):
+		}
+	}
+	return err
 }
 
 // writerShardForKey maps an ordering key to a shard index. Zero key → shard 0.

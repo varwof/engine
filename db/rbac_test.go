@@ -26,8 +26,8 @@ func TestGenerateSalt(t *testing.T) {
 	if s1 == s2 {
 		t.Fatal("salts should be unique")
 	}
-	if len(s1) != 16 {
-		t.Fatalf("expected 16 hex chars, got %d", len(s1))
+	if len(s1) != 32 {
+		t.Fatalf("expected 32 hex chars (16-byte salt), got %d", len(s1))
 	}
 }
 
@@ -49,12 +49,12 @@ func TestGenerateToken(t *testing.T) {
 }
 
 func TestHashAuditEntry(t *testing.T) {
-	h := HashAuditEntry("", "2024-01-01", "admin", "create", "test")
+	h := HashAuditEntry("", "2024-01-01", "admin", "1.2.3.4", "GET", "/x", "create", "test")
 	if len(h) != 64 {
 		t.Fatalf("expected 64 hex chars, got %d", len(h))
 	}
 
-	h2 := HashAuditEntry(h, "2024-01-02", "admin", "revoke", "serial=1")
+	h2 := HashAuditEntry(h, "2024-01-02", "admin", "1.2.3.4", "GET", "/y", "revoke", "serial=1")
 	if h2 == h {
 		t.Fatal("different inputs should produce different hashes")
 	}

@@ -491,6 +491,36 @@ func (i *CertIndex) setRevoked(ca, serial string, now time.Time, reason int) (*d
 	return sh.setRevokedLocked(k, now, reason)
 }
 
+// reconcileRevoked flips a resident certificate to revoked using the timestamp
+// and reason recorded by the backend, so an out-of-band DB revocation becomes
+// visible to in-memory reads (mTLS/OCSP/CRL) without waiting for a restart
+// (finding 7). No-op when the cert is missing or already revoked.
+func (i *CertIndex) reconcileRevoked(ca, serial string, revokedAt time.Time, reason *int) *db.CertRecord {
+	k := certKey{ca: ca, serial: serial}
+	sh := i.shardForKey(k)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	old, ok := sh.byKey[k]
+	if !ok || old.Status == "R" {
+		return nil
+	}
+	now := revokedAt
+	if now.IsZero() {
+		now = time.Now()
+	}
+	r := 0
+	if reason != nil {
+		r = *reason
+	}
+	clone := *old
+	clone.Status = "R"
+	clone.RevokedAt = &now
+	clone.RevokeReason = &r
+	clone.InvalidityDate = &now
+	sh.replaceLocked(old, &clone)
+	return &clone
+}
+
 // bulkSetRevoked marks a set of certificates revoked, grouping pairs by shard
 // so each shard is locked once. For each pair it reports the published
 // (revoked) record when the cert was active, and the keys that are not
@@ -623,6 +653,27 @@ func (i *CertIndex) bulkSetRevokedByCA(caName string, now time.Time, reason int)
 // from the secondary maps. Returns the evicted certificates' primary keys so
 // callers (e.g. the janitor) can cascade-clean related rows such as AIC
 // extensions.
+// remove deletes a resident certificate from the index, returning whether it
+// was present. Used to roll back a memory-first insert when the write pipeline
+// cannot queue the persistence (finding 18), so a certificate is never pinned
+// in memory without a backend write.
+func (i *CertIndex) remove(ca, serial string) bool {
+	k := certKey{ca: ca, serial: serial}
+	sh := i.shardForKey(k)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	_, ok := sh.byKey[k]
+	if !ok {
+		return false
+	}
+	sh.removeLocked(&db.CertRecord{CAName: ca, SerialNumber: serial})
+	i.count.Add(-1)
+	return true
+}
+
+// evictExpired removes certificates whose NotAfter has passed the cutoff from
+// the hot indexes, returning the removed keys so the caller can cascade-clean
+// related rows such as AIC extensions. It is the janitor's expiry path.
 func (i *CertIndex) evictExpired(cutoff time.Time) []certKey {
 	var evicted []certKey
 	for _, sh := range i.shards {

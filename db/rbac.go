@@ -10,7 +10,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"golang.org/x/crypto/argon2"
-	"log/slog"
 	"time"
 )
 
@@ -73,7 +72,7 @@ func HashPassword(password, salt string) string {
 }
 
 func GenerateSalt() (string, error) {
-	b := make([]byte, 8)
+	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		return "", fmt.Errorf("generate salt: %w", err)
 	}
@@ -95,8 +94,10 @@ func TokenHash(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func HashAuditEntry(prevHash, timestamp, username, action, detail string) string {
-	h := sha256.Sum256([]byte(prevHash + "|" + timestamp + "|" + username + "|" + action + "|" + detail))
+func HashAuditEntry(prevHash, timestamp, username, remoteAddr, method, path, action, detail string) string {
+	// The Merkle chain covers remote_addr/method/path too so an attacker with
+	// DB write access cannot alter those fields without breaking detection.
+	h := sha256.Sum256([]byte(prevHash + "|" + timestamp + "|" + username + "|" + remoteAddr + "|" + method + "|" + path + "|" + action + "|" + detail))
 	return hex.EncodeToString(h[:])
 }
 
@@ -282,7 +283,24 @@ type TokenHashRow struct {
 // ListAllTokenHashes returns every API token row (hash + owner + expiry). Used
 // by the engine to rebuild its in-memory token index on startup.
 func (d *DB) ListAllTokenHashes() ([]TokenHashRow, error) {
-	rows, err := d.Query("SELECT id, token, user_id, expires_at FROM rbac_api_tokens ORDER BY id")
+	return d.ListAllTokenHashesPage(0, 0)
+}
+
+// ListAllTokenHashesPage returns a page of API token rows (hash + owner +
+// expiry) ordered by id, for the engine's paginated startup rebuild (finding
+// 17). limit <= 0 returns the full set.
+func (d *DB) ListAllTokenHashesPage(limit, offset int) ([]TokenHashRow, error) {
+	query := "SELECT id, token, user_id, expires_at FROM rbac_api_tokens ORDER BY id"
+	if limit > 0 {
+		query += " LIMIT ? OFFSET ?"
+	}
+	var rows *sql.Rows
+	var err error
+	if limit > 0 {
+		rows, err = d.Query(query, limit, offset)
+	} else {
+		rows, err = d.Query(query)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -301,16 +319,17 @@ func (d *DB) ListAllTokenHashes() ([]TokenHashRow, error) {
 func (d *DB) LogAudit(username, remoteAddr, method, path, action, detail string) error {
 	maskedUser, maskedIP, err := d.MaskAuditFields(username, remoteAddr)
 	if err != nil {
-		// Salt failure must not block audit logging: fall back to plaintext
-		// (MaskAuditFields already returns the original values on error).
-		slog.Warn("audit: salt masking failed, storing plaintext", "error", err)
+		// Fail closed: never store plaintext identity when masking is enabled.
+		// A salt-load failure must surface as an error on the audited
+		// operation instead of silently persisting PII in the clear (finding 10).
+		return fmt.Errorf("audit mask: %w", err)
 	}
 	lastHash, err := d.GetLastAuditHash()
 	if err != nil {
 		return err
 	}
 	ts := time.Now().UTC().Format("2006-01-02 15:04:05")
-	h := HashAuditEntry(lastHash, ts, maskedUser, action, detail)
+	h := HashAuditEntry(lastHash, ts, maskedUser, maskedIP, method, path, action, detail)
 	_, err = d.Exec("INSERT INTO audit_log (timestamp, username, remote_addr, method, path, action, detail, entry_hash, prev_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		ts, maskedUser, maskedIP, method, path, action, detail, h, lastHash)
 	return err
@@ -358,7 +377,7 @@ func (d *DB) VerifyAuditChain() (int, error) {
 	}
 	var prevHash string
 	for _, e := range entries {
-		expected := HashAuditEntry(prevHash, e.Timestamp, e.Username, e.Action, e.Detail)
+		expected := HashAuditEntry(prevHash, e.Timestamp, e.Username, e.RemoteAddr, e.Method, e.Path, e.Action, e.Detail)
 		if e.EntryHash != expected {
 			return 0, fmt.Errorf("audit chain broken at entry %d: hash mismatch", e.ID)
 		}
@@ -390,7 +409,7 @@ func (d *DB) QueryAudit(limit, offset int) ([]AuditEntry, error) {
 }
 
 func (d *DB) backfillAuditHashes() error {
-	rows, err := d.Query("SELECT id, timestamp, username, action, detail FROM audit_log WHERE entry_hash IS NULL ORDER BY id ASC")
+	rows, err := d.Query("SELECT id, timestamp, username, remote_addr, method, path, action, detail FROM audit_log WHERE entry_hash IS NULL ORDER BY id ASC")
 	if err != nil {
 		return fmt.Errorf("query unhashed audit entries: %w", err)
 	}
@@ -398,11 +417,11 @@ func (d *DB) backfillAuditHashes() error {
 	var prevHash string
 	for rows.Next() {
 		var id int
-		var ts, username, action, detail string
-		if err := rows.Scan(&id, &ts, &username, &action, &detail); err != nil {
+		var ts, username, remoteAddr, method, path, action, detail string
+		if err := rows.Scan(&id, &ts, &username, &remoteAddr, &method, &path, &action, &detail); err != nil {
 			return err
 		}
-		h := HashAuditEntry(prevHash, ts, username, action, detail)
+		h := HashAuditEntry(prevHash, ts, username, remoteAddr, method, path, action, detail)
 		if _, err := d.Exec("UPDATE audit_log SET entry_hash = ?, prev_hash = ? WHERE id = ?", h, prevHash, id); err != nil {
 			return err
 		}

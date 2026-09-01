@@ -70,20 +70,26 @@ func (d *DB) HeartbeatGateway(address string) error {
 
 // ListActiveGateways returns all gateways with status='active'.
 func (d *DB) ListActiveGateways() ([]*GatewayRecord, error) {
-	return d.listGatewaysWhere("status = 'active'")
+	return d.listGateways(true)
 }
 
 // ListAllGateways returns all registered gateways.
 func (d *DB) ListAllGateways() ([]*GatewayRecord, error) {
-	return d.listGatewaysWhere("1=1")
+	return d.listGateways(false)
 }
 
-func (d *DB) listGatewaysWhere(where string) ([]*GatewayRecord, error) {
-	rows, err := d.Query(`
+func (d *DB) listGateways(activeOnly bool) ([]*GatewayRecord, error) {
+	query := `
 		SELECT id, address, ca_name, status, last_seen, registered
-		FROM gateway_registry
-		WHERE ` + where + `
-		ORDER BY registered`)
+		FROM gateway_registry`
+	var args []any
+	if activeOnly {
+		query += " WHERE status = ?"
+		args = append(args, "active")
+	}
+	query += `
+		ORDER BY registered`
+	rows, err := d.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list_gateways: %w", err)
 	}

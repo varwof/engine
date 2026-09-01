@@ -280,7 +280,7 @@ func (d *DB) ListCertsFilteredPage(caName, status, cn string, limit, offset int)
 	}
 	if cn != "" {
 		clauses = append(clauses, d.LikeExpr("common_name"))
-		args = append(args, cn)
+		args = append(args, d.LikeSearch(cn))
 	}
 	query := fmt.Sprintf(`
 		SELECT `+certColumns+`
@@ -871,4 +871,48 @@ func (d *DB) ListCertsNeedingAICBackfill() ([]struct {
 		results = append(results, r)
 	}
 	return results, rows.Err()
+}
+
+// RevokedCertRef is a minimal reference to a revoked certificate, used by the
+// engine's periodic reconciliation of out-of-band revocations.
+type RevokedCertRef struct {
+	CAName       string
+	SerialNumber string
+	RevokedAt    time.Time
+	RevokeReason *int
+}
+
+// ListRevokedCertRefsSince returns references to certificates whose status is
+// 'R' and whose revoked_at is on or after the RFC3339 `since` value. The
+// in-memory engine uses this to pick up revocations performed directly in the
+// backend (CLI-via-SQL, cross-tool backfill) without a full restart (finding 7).
+func (d *DB) ListRevokedCertRefsSince(since string) ([]RevokedCertRef, error) {
+	rows, err := d.Query(`
+		SELECT ca_name, serial_number, revoked_at, revoke_reason
+		FROM certificates WHERE status = 'R' AND revoked_at >= ?`,
+		since)
+	if err != nil {
+		return nil, fmt.Errorf("list revoked cert refs: %w", err)
+	}
+	defer rows.Close()
+	var refs []RevokedCertRef
+	for rows.Next() {
+		var ref RevokedCertRef
+		var revokedAt sql.NullString
+		var reason sql.NullInt64
+		if err := rows.Scan(&ref.CAName, &ref.SerialNumber, &revokedAt, &reason); err != nil {
+			return nil, fmt.Errorf("scan revoked cert ref: %w", err)
+		}
+		if revokedAt.Valid {
+			if t, err := time.Parse(time.RFC3339, revokedAt.String); err == nil {
+				ref.RevokedAt = t
+			}
+		}
+		if reason.Valid {
+			r := int(reason.Int64)
+			ref.RevokeReason = &r
+		}
+		refs = append(refs, ref)
+	}
+	return refs, rows.Err()
 }

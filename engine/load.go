@@ -72,12 +72,21 @@ func (e *Engine) load() error {
 		e.users.put(&users[i])
 	}
 
-	tokens, err := e.DB().ListAllTokenHashes()
-	if err != nil {
-		return err
-	}
-	for i := range tokens {
-		e.tokens.put(tokens[i])
+	// Paginate the token rebuild so a large API-token store cannot exhaust
+	// memory during startup (finding 17).
+	offset = 0
+	for {
+		tokens, err := e.DB().ListAllTokenHashesPage(loadPageSize, offset)
+		if err != nil {
+			return err
+		}
+		for i := range tokens {
+			e.tokens.put(tokens[i])
+		}
+		if len(tokens) < loadPageSize {
+			break
+		}
+		offset += len(tokens)
 	}
 
 	offset = 0

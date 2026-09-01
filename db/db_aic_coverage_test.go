@@ -869,6 +869,25 @@ func TestNewDistLockSQLite(t *testing.T) {
 	}
 }
 
+func TestNewDistLockMySQL(t *testing.T) {
+	// Dialect dispatch is tested without a live server: NewDistLock only
+	// switches on the dialect type and must never open a connection.
+	d := &DB{dialect: mysqlDialect{}}
+	lock := d.NewDistLock()
+	ml, ok := lock.(*mysqlAdvisoryLock)
+	if !ok {
+		t.Fatalf("expected *mysqlAdvisoryLock for mysql dialect, got %T", lock)
+	}
+	if got := ml.lockName(42); got != "varwof:core:42" {
+		t.Fatalf("unexpected lock name: %s", got)
+	}
+	// GET_LOCK is session-scoped, so the advisory lock must never be shared
+	// with a DB connection from the pool (which would release it prematurely).
+	if ml.d == nil {
+		t.Fatal("mysqlAdvisoryLock must reference the DB for Conn()")
+	}
+}
+
 func TestPGAdvisoryLockStruct(t *testing.T) {
 	d := newTestDB(t)
 	l := newPGAdvisoryLock(d)

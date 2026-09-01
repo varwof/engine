@@ -124,7 +124,7 @@ func (d *DB) SearchAICByCapability(schemeID string, limit, offset int) ([]*AICEx
 		limit = 100
 	}
 	query := d.Rebind(`SELECT id, ` + aicColumns + ` FROM aic_extensions WHERE capabilities_json LIKE ? ORDER BY created_at DESC LIMIT ? OFFSET ?`)
-	rows, err := d.Query(query, `%`+schemeID+`%`, limit, offset)
+	rows, err := d.Query(query, `%`+EscapeLike(schemeID)+`%`, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("search aic by capability: %w", err)
 	}

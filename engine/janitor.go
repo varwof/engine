@@ -6,6 +6,8 @@ package engine
 import (
 	"context"
 	"time"
+
+	"github.com/varwof/engine/db"
 )
 
 // janitorLoop runs expiry pruning on the configured interval until ctx ends.
@@ -57,6 +59,43 @@ func (e *Engine) janitor() {
 	} else if n > 0 {
 		e.opts.Logger.Info("engine: janitor pruned expired backend da nonces", "count", n)
 	}
+
+	// Reconcile out-of-band revocations: a certificate revoked directly in the
+	// backend (CLI-via-SQL, cross-tool backfill, another node) must become
+	// revoked in memory so mTLS/OCSP/CRL stop authorizing it without waiting
+	// for a full restart (finding 7).
+	e.reconcileRevocations()
+}
+
+// reconcileRevocations picks up revocations made directly in the backend since
+// the last pass and flips the corresponding resident certificates to revoked,
+// using the backend-recorded timestamp/reason. Runs only from the janitor
+// goroutine, so the reconcileSince watermark needs no lock.
+func (e *Engine) reconcileRevocations() {
+	since := e.reconcileSince.Add(-5 * time.Minute) // overlap guard for clock skew
+	refs, err := e.DB().ListRevokedCertRefsSince(since.UTC().Format(time.RFC3339))
+	if err != nil {
+		e.opts.Logger.Warn("engine: revoke reconcile failed", "error", err)
+		return
+	}
+	var flipped []*db.CertRecord
+	for _, ref := range refs {
+		if rec := e.certIdx.reconcileRevoked(ref.CAName, ref.SerialNumber, ref.RevokedAt, ref.RevokeReason); rec != nil {
+			flipped = append(flipped, rec)
+		}
+		if !ref.RevokedAt.IsZero() && ref.RevokedAt.After(e.reconcileSince) {
+			e.reconcileSince = ref.RevokedAt
+		}
+	}
+	if len(flipped) == 0 {
+		return
+	}
+	e.revoked.putAll(flipped)
+	e.revokedCount.Add(uint64(len(flipped)))
+	if e.opts.OnCertRevoked != nil {
+		e.opts.OnCertRevoked("") // bulk
+	}
+	e.opts.Logger.Info("engine: reconciled out-of-band revocations", "count", len(flipped))
 }
 
 // pruneAICForEvicted drops AIC extensions whose certificates have left the hot

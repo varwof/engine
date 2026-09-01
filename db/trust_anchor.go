@@ -90,7 +90,7 @@ func (d *DB) ListTrustAnchors(filter *TrustAnchorFilter) ([]*TrustAnchor, error)
 		}
 		if filter.SubjectO != "" {
 			query += " AND " + d.LikeExpr("subject_o")
-			args = append(args, filter.SubjectO)
+			args = append(args, d.LikeSearch(filter.SubjectO))
 		}
 		if filter.SubjectC != "" {
 			query += " AND subject_c = ?"

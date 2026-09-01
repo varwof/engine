@@ -235,8 +235,15 @@ func (e *Engine) GetToken(token string) (*db.TokenInfo, error) {
 }
 
 func (e *Engine) validToken(te *tokenEntry) (*db.TokenInfo, bool) {
-	if te.expiresAt != nil && *te.expiresAt <= time.Now().UTC().Format(time.RFC3339) {
-		return nil, false
+	// Compare expiry as time, not as a lexicographic string: RFC3339 values
+	// with a non-UTC offset string-compare incorrectly and can outlive their
+	// real expiry (finding 19). A value that cannot be parsed is treated as
+	// expired (fail-safe).
+	if te.expiresAt != nil {
+		exp, err := time.Parse(time.RFC3339, *te.expiresAt)
+		if err != nil || !exp.After(time.Now()) {
+			return nil, false
+		}
 	}
 	u := e.users.getByID(te.userID)
 	if u == nil || !u.Enabled {

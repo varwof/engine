@@ -387,3 +387,107 @@ func TestSchemaMigrationV18AddsCertHashColumn(t *testing.T) {
 		t.Fatalf("insert after migration: %v", err)
 	}
 }
+
+func TestAcmeTokensEncryptedAtRest(t *testing.T) {
+	keyHex := "aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55"
+	d := newTestDB(t)
+	if err := d.SetAtRestKey(keyHex); err != nil {
+		t.Fatal(err)
+	}
+
+	acctID, _ := d.InsertAcmeAccount("thumb-atrest", `{}`, "a@b.c", "valid")
+	orderID, _ := d.InsertAcmeOrder(acctID, `[]`, "20991231T000000Z")
+	authzID, err := d.InsertAcmeAuthorization(orderID, "dns", "example.com", "supersecrettoken", "20991231T000000Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	challID, err := d.InsertAcmeChallenge(authzID, "http-01", "supersecrettoken")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The DB must NOT contain the plaintext token.
+	var storedAuthzToken, storedChallToken string
+	if err := d.QueryRow("SELECT token FROM acme_authorizations WHERE id = ?", authzID).Scan(&storedAuthzToken); err != nil {
+		t.Fatal(err)
+	}
+	if storedAuthzToken == "supersecrettoken" {
+		t.Fatal("authz token stored in plaintext despite at-rest key")
+	}
+	if err := d.QueryRow("SELECT token FROM acme_challenges WHERE id = ?", challID).Scan(&storedChallToken); err != nil {
+		t.Fatal(err)
+	}
+	if storedChallToken == "supersecrettoken" {
+		t.Fatal("challenge token stored in plaintext despite at-rest key")
+	}
+
+	// Reads must recover the original token transparently.
+	authz, err := d.GetAcmeAuthorization(authzID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authz.Token != "supersecrettoken" {
+		t.Fatalf("authz token mismatch after decrypt: got %q", authz.Token)
+	}
+	chall, err := d.GetAcmeChallenge(challID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chall.Token != "supersecrettoken" {
+		t.Fatalf("challenge token mismatch after decrypt: got %q", chall.Token)
+	}
+
+	authzs, err := d.GetAcmeAuthorizationsByOrder(orderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(authzs) != 1 || authzs[0].Token != "supersecrettoken" {
+		t.Fatalf("authz list decrypt failed: %+v", authzs)
+	}
+	challs, err := d.GetAcmeChallengesByAuthz(authzID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(challs) != 1 || challs[0].Token != "supersecrettoken" {
+		t.Fatalf("challenge list decrypt failed: %+v", challs)
+	}
+}
+
+func TestAcmeTokensPlaintextWithoutKey(t *testing.T) {
+	d := newTestDB(t)
+	acctID, _ := d.InsertAcmeAccount("thumb-plain", `{}`, "a@b.d", "valid")
+	orderID, _ := d.InsertAcmeOrder(acctID, `[]`, "20991231T000000Z")
+	authzID, err := d.InsertAcmeAuthorization(orderID, "dns", "example.com", "tok-plain", "20991231T000000Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	challID, err := d.InsertAcmeChallenge(authzID, "http-01", "tok-plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	authz, err := d.GetAcmeAuthorization(authzID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authz.Token != "tok-plain" {
+		t.Fatalf("expected plaintext passthrough without key, got %q", authz.Token)
+	}
+	chall, err := d.GetAcmeChallenge(challID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chall.Token != "tok-plain" {
+		t.Fatalf("expected plaintext passthrough without key, got %q", chall.Token)
+	}
+}
+
+func TestSetAtRestKeyRejectsBadLength(t *testing.T) {
+	d := newTestDB(t)
+	if err := d.SetAtRestKey("abcd"); err == nil {
+		t.Fatal("expected error for short key")
+	}
+	if err := d.SetAtRestKey("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"); err == nil {
+		t.Fatal("expected error for non-hex key")
+	}
+}

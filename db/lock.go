@@ -31,6 +31,20 @@ func (noopLock) Lock(_ context.Context, _ int64) error            { return nil }
 func (noopLock) TryLock(_ context.Context, _ int64) (bool, error) { return true, nil }
 func (noopLock) Unlock(_ int64) error                             { return nil }
 
+// failClosedLock reports an error on every acquisition attempt. It is returned
+// when a lock implementation cannot be set up (e.g. the on-disk lock directory
+// cannot be created), so callers learn that mutual exclusion is unavailable
+// rather than believing they hold a lock they do not (finding 13).
+type failClosedLock struct {
+	err error
+}
+
+func (l *failClosedLock) Lock(_ context.Context, _ int64) error { return l.err }
+func (l *failClosedLock) TryLock(_ context.Context, _ int64) (bool, error) {
+	return false, l.err
+}
+func (l *failClosedLock) Unlock(_ int64) error { return nil }
+
 // pgAdvisoryLock implements DistLock via PostgreSQL pg_advisory_lock.
 // Uses session-level locks so they auto-release on connection close.
 type pgAdvisoryLock struct {
@@ -113,10 +127,14 @@ func (d *DB) NewDistLock() DistLock {
 	switch d.dialect.(type) {
 	case pgDialect, *pgDialectWithConfig:
 		return newPGAdvisoryLock(d)
+	case mysqlDialect, *mysqlDialectWithConfig:
+		// MySQL GET_LOCK coordinates across hosts sharing the same server; the
+		// on-disk fallback below would not (each host locks its own /tmp).
+		return newMySQLAdvisoryLock(d)
 	}
-	// Non-PostgreSQL dialects (SQLite, MySQL): use a real on-disk lock so that
-	// multiple varwof-core processes sharing the same database coordinate (G-12).
-	// On platforms without flock support this falls back to noopLock.
+	// SQLite: use a real on-disk lock so that multiple varwof-core processes
+	// sharing the same database coordinate (G-12). On platforms without flock
+	// support this falls back to noopLock.
 	return newNonPGLock(d)
 }
 
