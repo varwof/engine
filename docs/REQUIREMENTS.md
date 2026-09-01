@@ -6,7 +6,7 @@
 
 ## 1. Background & Goal
 
-varwof-core's current data layer exhibits the following structural contradictions (confirmed under production high-concurrency load testing):
+varwof-core's current data layer exhibits the following structural contradictions (confirmed under high-concurrency load testing):
 
 1. **Write path**: SQLite global page-cache lock + single-write lock is the throughput bottleneck. The existing RecordBuffer decouples "sign + write-to-DB", improving throughput from 33 TPS → 7142 TPS (same machine EC P-256, 52× improvement), but it remains "async persistence + memory only as pending buffer" — memory does not participate in reads, reads still hit SQL.
 2. **Read path**: mTLS handshake, OCSP, CRL, nonce verification are all high-frequency point queries. Currently relies on 3 independent small caches (`revocationCache`, `authScopesCache`, OCSP LRU) each with its own TTL + manual invalidation, scattered across `cmd/pki/serve.go` and `internal/serve` — no unified memory data plane.
