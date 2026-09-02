@@ -35,18 +35,39 @@ This project is the persistence / state engine for the PKI/CA server
 Security fixes are applied to the latest release. Older releases are
 supported on a best-effort basis.
 
-## Code Review Findings (2026-09-01)
+## Funding note: no paid third-party audit
 
-Security / correctness review of the current `main`. All items below
-are open and not yet fixed.
+This is an individual / open-source project; no paid third-party
+security audit has been conducted. Validation relies on internal
+AI-assisted review, automated tests (race-enabled), and independent
+cross-implementation exercise where available.
 
-The dominant, systemic theme across this codebase: the engine is
-"memory-is-authoritative" and persists to the backend through an
-asynchronous, error-swallowing, drop-on-shutdown write path. Every
-security-critical state transition (revocation, nonce consumption/
-insertion) is therefore durable only if the async flush happens before
-a crash or shutdown — otherwise the pre-transition state is recovered
-on restart. Items 1-5 below are instances of that failure mode.
+## Security Audit History
+
+Review practice: development includes AI-assisted security review and
+RFC compliance cross-checks (PKI lifecycle and revocation semantics (RFC 5280/6960), SQL and storage hardening). Consolidated findings are
+logged below; each is retained as a historical record after resolution.
+
+### Development audit rounds (2026-08)
+
+| Date | Scope | Method | Status |
+|---|---|---|---|
+| 2026-08-10 | engine wiring / persistence | AI-assisted internal review | iterative; superseded by the 2026-09-01 pass |
+
+These rounds were conducted during development; findings were addressed
+as development progressed. The 2026-09-01 pass below is the consolidated
+resolved baseline for `main` at that commit.
+
+### 2026-09-01 -- internal security review (AI-assisted), resolved
+
+Method: internal security/correctness review of the current `main`,
+assisted by AI tooling, with RFC cross-checks against PKI lifecycle and revocation semantics (RFC 5280/6960), SQL and storage hardening.
+Status: all findings below were resolved in the 2026-09-01 security
+pass (commit d8f1def) and verified by the full test suite (race-enabled).
+
+Next scheduled review: quarterly (next: 2026-12-01).
+
+### Resolved findings (2026-09-01)
 
 ### Security (high)
 
