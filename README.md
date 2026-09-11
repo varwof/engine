@@ -1,5 +1,8 @@
 # varwof-engine
 
+> ⭐ Like this repo? Give a star to the flagship one:
+> [![GitHub stars](https://img.shields.io/github/stars/varwof/core?style=social&label=varwof/core)](https://github.com/varwof/core)
+
 > In-memory-centric high-performance data subsystem for varwof-core: OCSP / CRL / nonce / certificate status with resident-memory queries and batch persistence.
 
 > ⚠️ **Preview** — Not for production use. APIs and features may change before official release.
