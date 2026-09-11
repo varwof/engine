@@ -208,22 +208,21 @@ func (e *Engine) FlushAll() error {
 	if err := e.rb.FlushAll(); err != nil {
 		return err
 	}
-	n := len(e.writerShards)
-	barriers := make([]chan struct{}, n)
-	for i, ch := range e.writerShards {
-		barriers[i] = make(chan struct{})
+	for _, ch := range e.writerShards {
 		e.sendMu.RLock()
 		if e.stopped.Load() {
 			e.sendMu.RUnlock()
-			close(barriers[i])
-			continue
+			// Stopped: every submitted op was drained by the writers during Stop
+			// or runs inline on the caller, so there is nothing left to wait for
+			// (finding 5). Return success deterministically instead of racing the
+			// cancelled context.
+			return nil
 		}
-		ch <- func() error { close(barriers[i]); return nil }
 		e.sendMu.RUnlock()
-	}
-	for i := range barriers {
+		barrier := make(chan struct{})
+		ch <- func() error { close(barrier); return nil }
 		select {
-		case <-barriers[i]:
+		case <-barrier:
 		case <-e.ctx.Done():
 			return e.ctx.Err()
 		}

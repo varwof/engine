@@ -4,7 +4,6 @@
 package engine
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -375,23 +374,31 @@ func TestFilterSortedSortsMultipleResults(t *testing.T) {
 }
 
 // TestShutdownPaths verifies the post-shutdown behavior of enqueue and
-// FlushAll: with the writer loops gone and the channels at capacity, the
-// cancelled context wins deterministically and FlushAll reports it.
+// FlushAll: with the writer loops gone and the channels at capacity, an op
+// submits after Stop must run inline rather than deadlock (finding 5), and
+// FlushAll is a deterministic no-op success.
 func TestShutdownPaths(t *testing.T) {
 	e := newTestEngine(t)
 	e.Stop()
 
 	// Fill every writer shard to capacity; with no writer loops draining them,
-	// a send would block, so the cancelled ctx must win the select.
+	// a send would block, so the stopped fast-path must run the op inline.
 	for _, ch := range e.writerShards {
 		for i := 0; i < cap(ch); i++ {
 			ch <- func() error { return nil }
 		}
 	}
-	e.enqueue("", func() error { return nil }) // must return via ctx.Done
+	ran := make(chan struct{}, 1)
+	e.enqueue("", func() error { ran <- struct{}{}; return nil }) // runs inline after stop
 
-	if err := e.FlushAll(); !errors.Is(err, context.Canceled) {
-		t.Fatalf("FlushAll after stop: %v, want context.Canceled", err)
+	select {
+	case <-ran:
+	case <-time.After(time.Second):
+		t.Fatal("enqueue after stop did not run inline")
+	}
+
+	if err := e.FlushAll(); err != nil {
+		t.Fatalf("FlushAll after stop: %v, want nil", err)
 	}
 }
 
